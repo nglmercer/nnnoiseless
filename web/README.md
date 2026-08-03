@@ -78,8 +78,11 @@ and both paths share the same ~441 kB download (~208 kB gzipped).
 ## Layout
 
 - `index.html` — page structure;
-- `src/main.js` — wiring, clip processing, waveform drawing, mic setup;
-- `src/denoise-worklet.js` — the `AudioWorkletProcessor`;
+- `src/main.ts` — wiring, clip processing, waveform drawing, mic setup;
+- `src/denoise-worklet.ts` — the typed `AudioWorkletProcessor`;
 - `src/style.css` — styling, light and dark;
+- `src/audio-worklet.d.ts` — the missing Web Audio worklet globals;
+- `tsconfig.json` — strict browser-side type checking;
+- `vite.config.ts` — Vite configuration and raw-worklet transpilation;
 - `smoke-test.mjs` — headless verification of the wasm build;
 - `src/pkg/`, `src/pkg-worklet/` — generated, not checked in.

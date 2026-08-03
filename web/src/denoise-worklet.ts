@@ -1,6 +1,6 @@
 // AudioWorklet processor for the streaming denoiser.
 //
-// This file is never loaded on its own. `main.js` concatenates it with the
+// This file is never loaded on its own. `main.ts` concatenates it with the
 // `no-modules` wasm-bindgen glue and registers the result via a blob URL,
 // because an AudioWorkletGlobalScope has no `fetch` and so cannot load a wasm
 // module by URL itself. The compiled `WebAssembly.Module` is handed over from
@@ -10,20 +10,27 @@
 
 /* global wasm_bindgen, registerProcessor, AudioWorkletProcessor, sampleRate */
 
+type WorkletWasm = typeof wasm_bindgen & {
+  initSync(module: { module: WebAssembly.Module }): InitOutput;
+};
+
+const wasm = wasm_bindgen as WorkletWasm;
+
 class NnnoiselessProcessor extends AudioWorkletProcessor {
+  private denoiser: wasm_bindgen.Denoiser | null = null;
+  private bypass = false;
+  private blockCount = 0;
+
   constructor() {
     super();
-    this.denoiser = null;
-    this.bypass = false;
-    this.blockCount = 0;
 
-    this.port.onmessage = (event) => {
+    this.port.onmessage = (event: MessageEvent<any>) => {
       const msg = event.data;
       try {
         switch (msg.type) {
           case 'init': {
-            wasm_bindgen.initSync({ module: msg.module });
-            this.denoiser = wasm_bindgen.Denoiser.withSettings(
+            wasm.initSync({ module: msg.module });
+            this.denoiser = wasm.Denoiser.withSettings(
               msg.attenuationDb ?? 0,
               msg.vadThreshold ?? 0,
               0, // lookahead adds latency; keep the live path as tight as possible
@@ -58,7 +65,7 @@ class NnnoiselessProcessor extends AudioWorkletProcessor {
     };
   }
 
-  process(inputs, outputs) {
+  process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
     const input = inputs[0];
     const output = outputs[0];
     if (!output || output.length === 0) return true;

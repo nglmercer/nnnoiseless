@@ -8,11 +8,11 @@
 //     AudioWorklet.
 //
 // The clip path uses the ES-module wasm build. The worklet path needs the
-// `no-modules` build, for the reasons explained in `denoise-worklet.js`.
+// `no-modules` build, for the reasons explained in `denoise-worklet.ts`.
 
 import init, { activeIsa, denoiseBuffer, version } from './pkg/nnnoiseless.js';
 
-import workletSource from './denoise-worklet.js?raw';
+import workletSource from './denoise-worklet.ts?raw';
 import workletGlue from './pkg-worklet/nnnoiseless.js?raw';
 import workletWasmUrl from './pkg-worklet/nnnoiseless_bg.wasm?url';
 
@@ -21,41 +21,117 @@ import './style.css';
 const DEMO_SECONDS = 4;
 const SAMPLE_RATE = 48_000;
 
-const el = (id) => document.getElementById(id);
+// Some browsers expose a smaller global inside AudioWorkletGlobalScope and do
+// not provide TextDecoder there. wasm-bindgen's no-modules glue uses it while
+// the worklet module is being evaluated, so provide a small UTF-8 fallback
+// before concatenating that glue with the processor source.
+const WORKLET_TEXT_DECODER = `
+const TextDecoder = globalThis.TextDecoder || class TextDecoder {
+  decode(input = new Uint8Array()) {
+    let text = '';
+    for (let i = 0; i < input.length;) {
+      const first = input[i++];
+      let codePoint;
+      let length;
+
+      if (first < 0x80) {
+        codePoint = first;
+      } else if ((first & 0xe0) === 0xc0) {
+        codePoint = first & 0x1f;
+        length = 1;
+      } else if ((first & 0xf0) === 0xe0) {
+        codePoint = first & 0x0f;
+        length = 2;
+      } else if ((first & 0xf8) === 0xf0) {
+        codePoint = first & 0x07;
+        length = 3;
+      } else {
+        text += '\\ufffd';
+        continue;
+      }
+
+      if (i + length > input.length) {
+        text += '\\ufffd';
+        break;
+      }
+      let valid = true;
+      for (let j = 0; j < length; j += 1) {
+        const next = input[i++];
+        if ((next & 0xc0) !== 0x80) valid = false;
+        codePoint = (codePoint << 6) | (next & 0x3f);
+      }
+
+      if (
+        !valid ||
+        (length === 1 && codePoint < 0x80) ||
+        (length === 2 && codePoint < 0x800) ||
+        (length === 3 && codePoint < 0x10000) ||
+        codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ) {
+        text += '\\ufffd';
+      } else {
+        text += String.fromCodePoint(codePoint);
+      }
+    }
+    return text;
+  }
+};
+`;
+
+const el = <T extends HTMLElement>(id: string): T => {
+  const element = document.getElementById(id);
+  if (!element) throw new Error(`Missing UI element: #${id}`);
+  return element as T;
+};
 
 const ui = {
-  status: el('badge-status'),
-  version: el('badge-version'),
-  isa: el('badge-isa'),
-  attenuation: el('ctl-attenuation'),
-  attenuationOut: el('out-attenuation'),
-  vad: el('ctl-vad'),
-  vadOut: el('out-vad'),
-  lookahead: el('ctl-lookahead'),
-  lookaheadOut: el('out-lookahead'),
-  demo: el('btn-demo'),
-  file: el('file-input'),
-  clipInfo: el('clip-info'),
-  waveforms: el('waveforms'),
-  waveBefore: el('wave-before'),
-  waveAfter: el('wave-after'),
-  playBefore: el('play-before'),
-  playAfter: el('play-after'),
-  processTime: el('process-time'),
-  mic: el('btn-mic'),
-  bypass: el('ctl-bypass'),
-  vadMeter: el('vad-meter'),
-  vadValue: el('vad-value'),
-  micError: el('mic-error'),
+  status: el<HTMLElement>('badge-status'),
+  version: el<HTMLElement>('badge-version'),
+  isa: el<HTMLElement>('badge-isa'),
+  attenuation: el<HTMLInputElement>('ctl-attenuation'),
+  attenuationOut: el<HTMLOutputElement>('out-attenuation'),
+  vad: el<HTMLInputElement>('ctl-vad'),
+  vadOut: el<HTMLOutputElement>('out-vad'),
+  lookahead: el<HTMLInputElement>('ctl-lookahead'),
+  lookaheadOut: el<HTMLOutputElement>('out-lookahead'),
+  demo: el<HTMLButtonElement>('btn-demo'),
+  file: el<HTMLInputElement>('file-input'),
+  clipInfo: el<HTMLElement>('clip-info'),
+  waveforms: el<HTMLElement>('waveforms'),
+  waveBefore: el<HTMLCanvasElement>('wave-before'),
+  waveAfter: el<HTMLCanvasElement>('wave-after'),
+  playBefore: el<HTMLButtonElement>('play-before'),
+  playAfter: el<HTMLButtonElement>('play-after'),
+  processTime: el<HTMLElement>('process-time'),
+  mic: el<HTMLButtonElement>('btn-mic'),
+  bypass: el<HTMLInputElement>('ctl-bypass'),
+  vadMeter: el<HTMLElement>('vad-meter'),
+  vadValue: el<HTMLOutputElement>('vad-value'),
+  micError: el<HTMLElement>('mic-error'),
+};
+
+type Clip = { samples: Float32Array; sampleRate: number; name: string };
+type MicState = {
+  ctx: AudioContext;
+  stream: MediaStream;
+  node: AudioWorkletNode;
+  source: MediaStreamAudioSourceNode;
 };
 
 /** Everything that survives between interactions. */
-const state = {
-  clip: null, // { samples: Float32Array, sampleRate: number, name: string }
-  denoised: null, // Float32Array
+const state: {
+  clip: Clip | null;
+  denoised: Float32Array | null;
+  audioCtx: AudioContext | null;
+  playing: AudioBufferSourceNode | null;
+  mic: MicState | null;
+} = {
+  clip: null,
+  denoised: null,
   audioCtx: null,
-  playing: null, // currently playing AudioBufferSourceNode
-  mic: null, // { ctx, stream, node, source }
+  playing: null,
+  mic: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,7 +165,7 @@ function renderSettings() {
  * the same — but it does flatter a pitch-driven model, so treat it as an
  * illustration rather than a benchmark.
  */
-function makeNoisyDemo(seconds, sampleRate) {
+function makeNoisyDemo(seconds: number, sampleRate: number): Float32Array {
   const n = Math.floor(seconds * sampleRate);
   const out = new Float32Array(n);
   let seed = 0x2545f491;
@@ -115,14 +191,14 @@ function makeNoisyDemo(seconds, sampleRate) {
   return out;
 }
 
-function audioContext() {
+function audioContext(): AudioContext {
   if (!state.audioCtx || state.audioCtx.state === 'closed') {
     state.audioCtx = new AudioContext();
   }
   return state.audioCtx;
 }
 
-async function loadFile(file) {
+async function loadFile(file: File): Promise<void> {
   const bytes = await file.arrayBuffer();
   const ctx = audioContext();
   const decoded = await ctx.decodeAudioData(bytes);
@@ -139,7 +215,7 @@ async function loadFile(file) {
   setClip({ samples: mono, sampleRate: decoded.sampleRate, name: file.name });
 }
 
-function setClip(clip) {
+function setClip(clip: Clip): void {
   state.clip = clip;
   const seconds = clip.samples.length / clip.sampleRate;
   ui.clipInfo.textContent = `${clip.name} — ${seconds.toFixed(1)}s at ${(
@@ -149,7 +225,7 @@ function setClip(clip) {
   processClip();
 }
 
-function processClip() {
+function processClip(): void {
   if (!state.clip) return;
   const { samples, sampleRate } = state.clip;
   const s = settings();
@@ -177,7 +253,11 @@ function processClip() {
 // Waveform rendering
 // ---------------------------------------------------------------------------
 
-function drawWave(canvas, samples, which) {
+function drawWave(
+  canvas: HTMLCanvasElement,
+  samples: Float32Array,
+  which: 'before' | 'after',
+): void {
   const dpr = window.devicePixelRatio || 1;
   const cssWidth = canvas.clientWidth || 600;
   const cssHeight = Number(canvas.getAttribute('height'));
@@ -185,8 +265,8 @@ function drawWave(canvas, samples, which) {
   canvas.height = Math.floor(cssHeight * dpr);
 
   const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, cssWidth, cssHeight);
+  ctx!.scale(dpr, dpr);
+  ctx!.clearRect(0, 0, cssWidth, cssHeight);
 
   const styles = getComputedStyle(document.documentElement);
   const stroke = styles.getPropertyValue(
@@ -197,9 +277,9 @@ function drawWave(canvas, samples, which) {
   // One vertical bar per pixel column, spanning that column's min and max. This
   // is the honest way to draw a waveform that has far more samples than pixels.
   const perPixel = Math.max(1, Math.floor(samples.length / cssWidth));
-  ctx.strokeStyle = stroke.trim() || '#888';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
+  ctx!.strokeStyle = stroke.trim() || '#888';
+  ctx!.lineWidth = 1;
+  ctx!.beginPath();
   for (let x = 0; x < cssWidth; x += 1) {
     const start = x * perPixel;
     const end = Math.min(samples.length, start + perPixel);
@@ -211,24 +291,24 @@ function drawWave(canvas, samples, which) {
       if (v < min) min = v;
       if (v > max) max = v;
     }
-    ctx.moveTo(x + 0.5, mid - max * mid * 0.95);
-    ctx.lineTo(x + 0.5, mid - min * mid * 0.95);
+    ctx!.moveTo(x + 0.5, mid - max * mid * 0.95);
+    ctx!.lineTo(x + 0.5, mid - min * mid * 0.95);
   }
-  ctx.stroke();
+  ctx!.stroke();
 
   // Centre line.
-  ctx.strokeStyle = styles.getPropertyValue('--grid').trim() || '#ccc';
-  ctx.beginPath();
-  ctx.moveTo(0, mid);
-  ctx.lineTo(cssWidth, mid);
-  ctx.stroke();
+  ctx!.strokeStyle = styles.getPropertyValue('--grid').trim() || '#ccc';
+  ctx!.beginPath();
+  ctx!.moveTo(0, mid);
+  ctx!.lineTo(cssWidth, mid);
+  ctx!.stroke();
 }
 
 // ---------------------------------------------------------------------------
 // Playback
 // ---------------------------------------------------------------------------
 
-function stopPlayback() {
+function stopPlayback(): void {
   if (state.playing) {
     try {
       state.playing.stop();
@@ -241,19 +321,21 @@ function stopPlayback() {
   ui.playAfter.textContent = '▶ Play';
 }
 
-async function play(samples, button) {
+async function play(samples: Float32Array, button: HTMLButtonElement): Promise<void> {
   const wasPlaying = state.playing;
   stopPlayback();
   if (wasPlaying && button.dataset.active === 'true') {
     button.dataset.active = 'false';
     return;
   }
+  const clip = state.clip;
+  if (!clip) return;
 
   const ctx = audioContext();
   await ctx.resume();
 
-  const buffer = ctx.createBuffer(1, samples.length, state.clip.sampleRate);
-  buffer.copyToChannel(samples, 0);
+  const buffer = ctx.createBuffer(1, samples.length, clip.sampleRate);
+  buffer.copyToChannel(new Float32Array(samples), 0);
   const source = ctx.createBufferSource();
   source.buffer = buffer;
   source.connect(ctx.destination);
@@ -281,8 +363,8 @@ async function play(samples, button) {
  * into a single blob, so that the processor can reach the `wasm_bindgen` symbol
  * the glue defines.
  */
-async function registerWorklet(ctx) {
-  const blob = new Blob([workletGlue, '\n', workletSource], {
+async function registerWorklet(ctx: AudioContext): Promise<void> {
+  const blob = new Blob([WORKLET_TEXT_DECODER, workletGlue, '\n', workletSource], {
     type: 'application/javascript',
   });
   const url = URL.createObjectURL(blob);
@@ -293,7 +375,7 @@ async function registerWorklet(ctx) {
   }
 }
 
-async function startMic() {
+async function startMic(): Promise<void> {
   ui.micError.hidden = true;
   ui.mic.disabled = true;
   ui.mic.textContent = 'Starting…';
@@ -352,14 +434,14 @@ async function startMic() {
 
     node.port.postMessage({ type: 'bypass', value: ui.bypass.checked });
     state.mic = { ctx, stream, node, source };
-  } catch (err) {
-    showMicError(err && err.message ? err.message : String(err));
+  } catch (err: unknown) {
+    showMicError(errorMessage(err));
     ui.mic.disabled = false;
     ui.mic.textContent = 'Start microphone';
   }
 }
 
-function stopMic() {
+function stopMic(): void {
   if (!state.mic) return;
   const { ctx, stream, node, source } = state.mic;
   source.disconnect();
@@ -374,7 +456,11 @@ function stopMic() {
   ui.vadValue.textContent = '0.00';
 }
 
-function showMicError(message) {
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function showMicError(message: string): void {
   ui.micError.textContent = `Microphone unavailable: ${message}`;
   ui.micError.hidden = false;
 }
@@ -414,15 +500,16 @@ async function main() {
     });
   });
 
-  ui.file.addEventListener('change', async (event) => {
-    const file = event.target.files && event.target.files[0];
+  ui.file.addEventListener('change', async (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
     if (!file) return;
     stopPlayback();
     ui.clipInfo.textContent = 'decoding…';
     try {
       await loadFile(file);
-    } catch (err) {
-      ui.clipInfo.textContent = `could not decode: ${err.message ?? err}`;
+    } catch (err: unknown) {
+      ui.clipInfo.textContent = `could not decode: ${errorMessage(err)}`;
     }
   });
 
@@ -435,14 +522,14 @@ async function main() {
   });
 
   window.addEventListener('resize', () => {
-    if (state.clip) {
+    if (state.clip && state.denoised) {
       drawWave(ui.waveBefore, state.clip.samples, 'before');
       drawWave(ui.waveAfter, state.denoised, 'after');
     }
   });
 }
 
-main().catch((err) => {
-  ui.status.textContent = `failed: ${err.message ?? err}`;
+main().catch((err: unknown) => {
+  ui.status.textContent = `failed: ${errorMessage(err)}`;
   ui.status.classList.add('bad');
 });
