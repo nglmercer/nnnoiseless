@@ -24,6 +24,11 @@ pub enum Isa {
     Avx2Fma,
     /// AArch64 Advanced SIMD.
     Neon,
+    /// WebAssembly fixed-width SIMD.
+    ///
+    /// Unlike the others this is a compile-time decision: WebAssembly has no runtime feature
+    /// detection, so `simd128` has to be enabled when the module is built.
+    Simd128,
 }
 
 impl std::fmt::Display for Isa {
@@ -32,6 +37,7 @@ impl std::fmt::Display for Isa {
             Isa::Scalar => "scalar",
             Isa::Avx2Fma => "avx2+fma",
             Isa::Neon => "neon",
+            Isa::Simd128 => "simd128",
         };
         f.write_str(s)
     }
@@ -86,8 +92,16 @@ impl Kernels {
             }
         }
 
+        // WebAssembly cannot probe for features at runtime, so the best we can do is report
+        // what the module was compiled with. The portable bodies vectorize fine under
+        // `-C target-feature=+simd128`.
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        let isa = Isa::Simd128;
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        let isa = Isa::Scalar;
+
         Kernels {
-            isa: Isa::Scalar,
+            isa,
             dot: dot_body,
             xcorr: xcorr_body,
             matvec: matvec_body,

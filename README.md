@@ -11,6 +11,7 @@ The crate also provides:
 - tunable denoising parameters, including an attenuation limit and lookahead;
 - multi-channel denoising with linked gains;
 - a windowed-sinc resampler, so input at other sample rates can be converted;
+- a WebAssembly build with JavaScript bindings, and a browser demo;
 - a WAV/RAW command-line program;
 - an optional DASP `Signal` adapter;
 - an optional CPAL microphone example that records a WAV and writes a
@@ -272,6 +273,27 @@ gains. Above roughly 7 dB input SNR the reshaping costs more waveform accuracy
 than the removed noise is worth. This is expected, and is why the quality tests
 only require improvement below that point.
 
+## In the browser
+
+The crate compiles to WebAssembly, and `web/` holds a Vite demo that denoises
+both a decoded clip and live microphone input:
+
+```bash
+cd web
+npm install
+npm run wasm     # wasm-pack build, both targets
+npm run dev      # http://localhost:5173
+```
+
+The bindings live behind the `wasm` feature: a streaming `Denoiser` class for
+live audio, which buffers internally so it can be fed the 128-sample blocks an
+`AudioWorklet` delivers, and a `denoiseBuffer` function that handles a whole
+clip and resamples to 48 kHz and back. `web/smoke-test.mjs` verifies the build
+headlessly with `npm test`. See [web/README.md](web/README.md).
+
+The module is about 441 kB (208 kB gzipped) and runs at roughly 100x realtime
+in Node with `simd128` enabled.
+
 ## Record a microphone and denoise it
 
 The `mic_denoise` example uses [CPAL](https://docs.rs/cpal/latest/cpal/) to
@@ -316,6 +338,10 @@ cargo check --example mic_denoise --features mic-example
 cargo doc --no-deps --all-features
 cargo build --release
 cargo bench
+
+# WebAssembly
+cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+(cd web && npm install && npm run build)
 ```
 
 The quality tests print their measurements:

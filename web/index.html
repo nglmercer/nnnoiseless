@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>nnnoiseless — speech denoising in the browser</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔇</text></svg>" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>nnnoiseless</h1>
+      <p class="tagline">RNNoise-style speech denoising, compiled to WebAssembly.</p>
+      <dl class="badges" id="badges">
+        <div><dt>status</dt><dd id="badge-status">loading…</dd></div>
+        <div><dt>version</dt><dd id="badge-version">—</dd></div>
+        <div><dt>kernels</dt><dd id="badge-isa">—</dd></div>
+      </dl>
+    </header>
+
+    <main>
+      <section class="panel">
+        <h2>1. Denoising settings</h2>
+        <p class="hint">
+          These map onto <code>DenoiseParams</code>. The defaults reproduce the
+          original RNNoise behaviour exactly.
+        </p>
+        <div class="controls">
+          <label>
+            <span class="label-row">
+              <span>Attenuation limit</span>
+              <output id="out-attenuation">off</output>
+            </span>
+            <input type="range" id="ctl-attenuation" min="0" max="30" step="1" value="0" />
+            <small
+              >Leaves a noise floor instead of suppressing to silence. Usually
+              the fix for “musical noise”.</small
+            >
+          </label>
+
+          <label>
+            <span class="label-row">
+              <span>VAD gate threshold</span>
+              <output id="out-vad">off</output>
+            </span>
+            <input type="range" id="ctl-vad" min="0" max="0.95" step="0.05" value="0" />
+            <small>Attenuates frames the model thinks contain no speech.</small>
+          </label>
+
+          <label>
+            <span class="label-row">
+              <span>Lookahead</span>
+              <output id="out-lookahead">0 frames</output>
+            </span>
+            <input type="range" id="ctl-lookahead" min="0" max="6" step="1" value="0" />
+            <small
+              >Protects speech onsets by deciding gains a few frames late.
+              Offline only — it adds latency.</small
+            >
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>2. Process a clip</h2>
+        <p class="hint">
+          Load an audio file, or generate a synthetic noisy sample, then compare
+          the two. Uses <code>denoiseBuffer</code>, which resamples to 48&nbsp;kHz
+          and back for you.
+        </p>
+        <div class="row">
+          <button id="btn-demo" class="primary">Generate noisy sample</button>
+          <label class="filebutton">
+            <input type="file" id="file-input" accept="audio/*" />
+            <span>Load audio file…</span>
+          </label>
+          <span class="spacer"></span>
+          <span id="clip-info" class="muted">no clip loaded</span>
+        </div>
+
+        <div class="waveforms" id="waveforms" hidden>
+          <figure>
+            <figcaption>
+              <span class="swatch swatch-before"></span> Original
+              <button class="ghost" id="play-before">▶ Play</button>
+            </figcaption>
+            <canvas id="wave-before" height="110"></canvas>
+          </figure>
+          <figure>
+            <figcaption>
+              <span class="swatch swatch-after"></span> Denoised
+              <button class="ghost" id="play-after">▶ Play</button>
+              <span id="process-time" class="muted"></span>
+            </figcaption>
+            <canvas id="wave-after" height="110"></canvas>
+          </figure>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>3. Live microphone</h2>
+        <p class="hint">
+          Runs the streaming <code>Denoiser</code> inside an
+          <code>AudioWorklet</code>. Use headphones — speakers will feed back.
+        </p>
+        <div class="row">
+          <button id="btn-mic" class="primary">Start microphone</button>
+          <label class="checkbox">
+            <input type="checkbox" id="ctl-bypass" />
+            <span>Bypass (hear the raw input)</span>
+          </label>
+        </div>
+        <div class="meter-block">
+          <span class="meter-label">Speech probability</span>
+          <div class="meter"><div class="meter-fill" id="vad-meter"></div></div>
+          <output id="vad-value">0.00</output>
+        </div>
+        <p id="mic-error" class="error" hidden></p>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Built from the <code>nnnoiseless</code> Rust crate with
+        <code>wasm-pack</code>. See <code>web/README.md</code> for the build
+        steps.
+      </p>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "nnnoiseless-web",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Browser demo for the nnnoiseless speech denoiser, running as WebAssembly.",
+  "scripts": {
+    "wasm": "npm run wasm:web && npm run wasm:worklet",
+    "wasm:web": "cd .. && RUSTFLAGS=\"-C target-feature=+simd128\" wasm-pack build --target web --out-dir web/src/pkg --no-default-features --features wasm",
+    "wasm:worklet": "cd .. && RUSTFLAGS=\"-C target-feature=+simd128\" wasm-pack build --target no-modules --out-dir web/src/pkg-worklet --no-default-features --features wasm",
+    "dev": "vite",
+    "build": "npm run wasm && vite build && npm test",
+    "preview": "vite preview",
+    "test": "node smoke-test.mjs"
+  },
+  "devDependencies": {
+    "vite": "^7.1.5"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}

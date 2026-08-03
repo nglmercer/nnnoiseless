@@ -1,2 +1,8 @@
 /target/
 **.wav
+
+# Web demo: dependencies, bundle output, and wasm-pack artifacts.
+web/node_modules/
+web/dist/
+web/src/pkg/
+web/src/pkg-worklet/

@@ -29,6 +29,8 @@ mod pitch;
 mod resample;
 mod rnn;
 mod simd;
+#[cfg(feature = "wasm")]
+mod wasm;
 
 pub use denoise::{denoise_offline, DenoiseState};
 pub use features::DenoiseFeatures;
