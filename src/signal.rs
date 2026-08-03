@@ -5,7 +5,7 @@ use dasp::sample::Sample;
 use dasp::signal::Signal;
 use std::borrow::Cow;
 
-use crate::{DenoiseState, RnnModel, FRAME_SIZE};
+use crate::{DenoiseParams, DenoiseState, RnnModel, FRAME_SIZE};
 
 /// Applies denoising to a `Signal` (from the `dasp` crate).
 ///
@@ -55,7 +55,7 @@ impl<'model, S: Signal> DenoiseSignal<'model, S> {
     pub fn with_model(input: S, model: &'model RnnModel) -> DenoiseSignal<'model, S> {
         DenoiseSignal {
             input,
-            states: vec![DenoiseState::from_model_owned(Cow::Borrowed(model)); S::Frame::CHANNELS],
+            states: vec![DenoiseState::from_model_owned(Cow::Borrowed(model), DenoiseParams::default()); S::Frame::CHANNELS],
             in_bufs: vec![[0.0; FRAME_SIZE]; S::Frame::CHANNELS],
             out_bufs: vec![[0.0; FRAME_SIZE]; S::Frame::CHANNELS],
             out_idx: 0,
@@ -72,7 +72,7 @@ impl<'model, S: Signal> DenoiseSignal<'model, S> {
     pub fn from_model(input: S, model: RnnModel) -> DenoiseSignal<'static, S> {
         DenoiseSignal {
             input,
-            states: vec![DenoiseState::from_model_owned(Cow::Owned(model)); S::Frame::CHANNELS],
+            states: vec![DenoiseState::from_model_owned(Cow::Owned(model), DenoiseParams::default()); S::Frame::CHANNELS],
             in_bufs: vec![[0.0; FRAME_SIZE]; S::Frame::CHANNELS],
             out_bufs: vec![[0.0; FRAME_SIZE]; S::Frame::CHANNELS],
             out_idx: 0,

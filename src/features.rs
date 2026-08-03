@@ -3,22 +3,40 @@
 //! This module contains utilities for computing features of an audio signal. These features are
 //! fed into the trained neural net for noise removal and speech detection.
 
+use std::sync::Arc;
+
+use realfft::{ComplexToReal, RealToComplex};
+
 use crate::{
     common, Complex, CEPS_MEM, FRAME_SIZE, FREQ_SIZE, NB_BANDS, NB_DELTA_CEPS, NB_FEATURES,
     PITCH_BUF_SIZE, WINDOW_SIZE,
 };
-use easyfft::{dyn_size::realfft::DynRealDft, prelude::*};
+
+/// How much room past the required history we keep, in frames.
+///
+/// Every frame needs the last `PITCH_BUF_SIZE` samples as one contiguous slice. Shifting the
+/// whole buffer down by a frame each time meant moving 1248 floats per frame. Instead we
+/// append into slack space and compact only once it runs out, which amortizes the move to
+/// `PITCH_BUF_SIZE / HISTORY_SLACK_FRAMES` floats per frame.
+const HISTORY_SLACK_FRAMES: usize = 8;
+const HISTORY_CAP: usize = PITCH_BUF_SIZE + HISTORY_SLACK_FRAMES * FRAME_SIZE;
 
 /// Contains the necessary state to compute the features of audio input and synthesize the output.
 ///
 /// This is quite a large struct and should probably be kept behind some kind of pointer.
 #[derive(Clone)]
 pub struct DenoiseFeatures {
-    /// This stores some of the previous input. Currently, whenever we get new input we shift this
-    /// backwards and copy the new input at the end. It might be worth investigating a ring buffer.
-    input_mem: [f32; max(FRAME_SIZE, PITCH_BUF_SIZE)],
+    /// Recent input samples. The live window is always `history[end - PITCH_BUF_SIZE..end]`.
+    history: Vec<f32>,
+    /// One past the newest sample in `history`.
+    end: usize,
     /// This is some sort of ring buffer, storing the last bunch of cepstra.
-    cepstral_mem: [[f32; crate::NB_BANDS]; crate::CEPS_MEM],
+    cepstral_mem: [[f32; NB_BANDS]; CEPS_MEM],
+    /// Cached squared distances between every pair of entries in `cepstral_mem`.
+    ///
+    /// Only one row of `cepstral_mem` changes per frame, so recomputing the whole matrix each
+    /// time (64 x 22 operations) was wasted work; updating one row and column costs 8 x 22.
+    ceps_dist: [[f32; CEPS_MEM]; CEPS_MEM],
     /// The index pointing to the most recent cepstrum in `cepstral_mem`. The previous cepstra are
     /// at indices mem_id - 1, mem_id - 2, etc (wrapped appropriately).
     mem_id: usize,
@@ -26,47 +44,56 @@ pub struct DenoiseFeatures {
     synthesis_mem: [f32; FRAME_SIZE],
     window_buf: [f32; WINDOW_SIZE],
 
-    // What follows are various buffers. The names are cryptic, but they follow a pattern.
     /// The Fourier transform of the most recent frame of input.
-    pub x: DynRealDft<f32>,
+    x: Vec<Complex>,
     /// The Fourier transform of a pitch-period-shifted window of input.
-    pub p: DynRealDft<f32>,
+    p: Vec<Complex>,
     /// The band energies of `x` (the signal).
-    pub ex: [f32; NB_BANDS],
+    ex: [f32; NB_BANDS],
     /// The band energies of `p` (the signal, lagged by one pitch period).
-    pub ep: [f32; NB_BANDS],
+    ep: [f32; NB_BANDS],
     /// The band correlations between `x` (the signal) and `p` (the pitch-period-lagged signal).
-    pub exp: [f32; NB_BANDS],
+    exp: [f32; NB_BANDS],
     /// The computed features.
     features: [f32; NB_FEATURES],
 
-    pitch_finder: crate::pitch::PitchFinder,
-}
+    /// Number of frames processed, used to decide when to redo the pitch search.
+    frame_count: u64,
 
-const fn max(a: usize, b: usize) -> usize {
-    if a > b {
-        a
-    } else {
-        b
-    }
+    fft_scratch: Vec<Complex>,
+    fwd: Arc<dyn RealToComplex<f32>>,
+    inv: Arc<dyn ComplexToReal<f32>>,
+
+    pitch_finder: crate::pitch::PitchFinder,
 }
 
 impl DenoiseFeatures {
     /// Creates a new, empty, `DenoiseFeatures`.
     pub fn new() -> DenoiseFeatures {
+        let c = common();
+        let fwd = Arc::clone(&c.fft_fwd);
+        let inv = Arc::clone(&c.fft_inv);
+        let scratch_len = fwd.get_scratch_len().max(inv.get_scratch_len());
+
         DenoiseFeatures {
-            input_mem: [0.0; max(FRAME_SIZE, PITCH_BUF_SIZE)],
+            history: vec![0.0; HISTORY_CAP],
+            end: PITCH_BUF_SIZE,
             cepstral_mem: [[0.0; NB_BANDS]; CEPS_MEM],
+            ceps_dist: [[0.0; CEPS_MEM]; CEPS_MEM],
             mem_id: 0,
             mem_hp_x: [0.0; 2],
             synthesis_mem: [0.0; FRAME_SIZE],
             window_buf: [0.0; WINDOW_SIZE],
-            x: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
-            p: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
+            x: vec![Complex::default(); FREQ_SIZE],
+            p: vec![Complex::default(); FREQ_SIZE],
             ex: [0.0; NB_BANDS],
             ep: [0.0; NB_BANDS],
             exp: [0.0; NB_BANDS],
             features: [0.0; NB_FEATURES],
+            frame_count: 0,
+            fft_scratch: vec![Complex::default(); scratch_len],
+            fwd,
+            inv,
             pitch_finder: crate::pitch::PitchFinder::new(),
         }
     }
@@ -76,34 +103,88 @@ impl DenoiseFeatures {
         &self.features[..]
     }
 
+    /// The per-band energies of the current input frame.
+    pub fn band_energies(&self) -> &[f32] {
+        &self.ex[..]
+    }
+
+    /// The per-band energies of the input lagged by one pitch period.
+    pub fn pitch_band_energies(&self) -> &[f32] {
+        &self.ep[..]
+    }
+
+    /// The per-band correlation between the input and its pitch-lagged copy.
+    ///
+    /// This is the quantity the training scripts compare against the ideal gain.
+    pub fn band_correlations(&self) -> &[f32] {
+        &self.exp[..]
+    }
+
+    /// Forgets all history, as though no audio had been processed.
+    pub fn reset(&mut self) {
+        for x in self.history.iter_mut() {
+            *x = 0.0;
+        }
+        self.end = PITCH_BUF_SIZE;
+        self.cepstral_mem = [[0.0; NB_BANDS]; CEPS_MEM];
+        self.ceps_dist = [[0.0; CEPS_MEM]; CEPS_MEM];
+        self.mem_id = 0;
+        self.mem_hp_x = [0.0; 2];
+        self.synthesis_mem = [0.0; FRAME_SIZE];
+        self.features = [0.0; NB_FEATURES];
+        self.frame_count = 0;
+        self.pitch_finder = crate::pitch::PitchFinder::new();
+    }
+
+    /// Makes room for one more frame and returns the range it should be written to.
+    fn advance(&mut self) -> std::ops::Range<usize> {
+        if self.end + FRAME_SIZE > HISTORY_CAP {
+            self.history.copy_within((self.end - PITCH_BUF_SIZE)..self.end, 0);
+            self.end = PITCH_BUF_SIZE;
+        }
+        let range = self.end..(self.end + FRAME_SIZE);
+        self.end += FRAME_SIZE;
+        range
+    }
+
+    /// The last `PITCH_BUF_SIZE` input samples, oldest first.
+    ///
+    /// The hot paths inline this so that they can borrow `history` and `window_buf`
+    /// separately, so it only survives as a test helper.
+    #[cfg(test)]
+    fn history(&self) -> &[f32] {
+        &self.history[(self.end - PITCH_BUF_SIZE)..self.end]
+    }
+
     /// Shifts our input buffer and adds the new input to it. This is mainly used when generating
     /// training data: when running the noise reduction we use [`DenoiseFeatures::shift_and_filter_input`]
     /// instead.
     pub fn shift_input(&mut self, input: &[f32]) {
         assert!(input.len() == FRAME_SIZE);
-        let new_idx = self.input_mem.len() - FRAME_SIZE;
-        for i in 0..new_idx {
-            self.input_mem[i] = self.input_mem[i + FRAME_SIZE];
-        }
-        for (x, y) in self.input_mem[new_idx..].iter_mut().zip(input) {
-            *x = *y;
-        }
+        let range = self.advance();
+        self.history[range].copy_from_slice(input);
     }
 
     /// Shifts our input buffer and adds the new input to it, while running the input through a
     /// high-pass filter.
     pub fn shift_and_filter_input(&mut self, input: &[f32]) {
         assert!(input.len() == FRAME_SIZE);
-        let new_idx = self.input_mem.len() - FRAME_SIZE;
-        for i in 0..new_idx {
-            self.input_mem[i] = self.input_mem[i + FRAME_SIZE];
-        }
-        crate::util::BIQUAD_HP.filter(&mut self.input_mem[new_idx..], &mut self.mem_hp_x, input);
+        let range = self.advance();
+        crate::util::BIQUAD_HP.filter(&mut self.history[range], &mut self.mem_hp_x, input);
     }
 
-    fn find_pitch(&mut self) -> usize {
-        let input = &self.input_mem[self.input_mem.len().checked_sub(PITCH_BUF_SIZE).unwrap()..];
-        let (pitch, _gain) = self.pitch_finder.process(input);
+    fn find_pitch(&mut self, interval: usize) -> usize {
+        // The pitch period moves slowly compared to the 10ms frame rate, so the search can be
+        // run less often. This is off by default because it does change the output.
+        if interval > 1 && self.frame_count % interval as u64 != 0 {
+            let (period, _) = self.pitch_finder.last();
+            if period != 0 {
+                return period;
+            }
+        }
+        // Borrowing `history` and `pitch_finder` as separate fields keeps this allocation-free.
+        let start = self.end - PITCH_BUF_SIZE;
+        let (pitch, _gain) = self.pitch_finder.process(&self.history[start..self.end]);
         pitch
     }
 
@@ -111,26 +192,45 @@ impl DenoiseFeatures {
     ///
     /// The return value is `true` if the input was pretty much silent.
     pub fn compute_frame_features(&mut self) -> bool {
+        self.compute_frame_features_with(1)
+    }
+
+    /// As [`DenoiseFeatures::compute_frame_features`], but only redoing the pitch search every
+    /// `pitch_interval` frames.
+    pub(crate) fn compute_frame_features_with(&mut self, pitch_interval: usize) -> bool {
         let mut ly = [0.0; NB_BANDS];
         let mut tmp = [0.0; NB_BANDS];
 
-        transform_input(
-            &self.input_mem,
-            0,
-            &mut self.window_buf,
-            &mut self.x,
-            &mut self.ex,
-        );
-        let pitch_idx = self.find_pitch();
+        {
+            let hist_start = self.end - PITCH_BUF_SIZE;
+            let (history, window_buf) = (&self.history[hist_start..self.end], &mut self.window_buf);
+            transform_input(
+                history,
+                0,
+                window_buf,
+                &mut self.x,
+                &mut self.ex,
+                &self.fwd,
+                &mut self.fft_scratch,
+            );
+        }
+        let pitch_idx = self.find_pitch(pitch_interval);
+        self.frame_count = self.frame_count.wrapping_add(1);
 
-        transform_input(
-            &self.input_mem,
-            pitch_idx,
-            &mut self.window_buf,
-            &mut self.p,
-            &mut self.ep,
-        );
-        crate::compute_band_corr(&mut self.exp[..], &self.x[..], &self.p[..]);
+        {
+            let hist_start = self.end - PITCH_BUF_SIZE;
+            let (history, window_buf) = (&self.history[hist_start..self.end], &mut self.window_buf);
+            transform_input(
+                history,
+                pitch_idx,
+                window_buf,
+                &mut self.p,
+                &mut self.ep,
+                &self.fwd,
+                &mut self.fft_scratch,
+            );
+        }
+        crate::compute_band_corr(&mut self.exp[..], &self.x, &self.p);
         for i in 0..NB_BANDS {
             self.exp[i] /= (0.001 + self.ex[i] * self.ep[i]).sqrt();
         }
@@ -180,6 +280,17 @@ impl DenoiseFeatures {
         for i in 0..NB_BANDS {
             self.cepstral_mem[ceps_0_idx][i] = self.features[i];
         }
+        // Only the row we just wrote can have changed, so refresh that row and column of the
+        // cached distance matrix rather than all of it.
+        for j in 0..CEPS_MEM {
+            let mut dist = 0.0;
+            for k in 0..NB_BANDS {
+                let tmp = self.cepstral_mem[ceps_0_idx][k] - self.cepstral_mem[j][k];
+                dist += tmp * tmp;
+            }
+            self.ceps_dist[ceps_0_idx][j] = dist;
+            self.ceps_dist[j][ceps_0_idx] = dist;
+        }
         self.mem_id += 1;
 
         let ceps_0 = &self.cepstral_mem[ceps_0_idx];
@@ -199,13 +310,8 @@ impl DenoiseFeatures {
         for i in 0..CEPS_MEM {
             let mut min_dist = 1e15f32;
             for j in 0..CEPS_MEM {
-                let mut dist = 0.0;
-                for k in 0..NB_BANDS {
-                    let tmp = self.cepstral_mem[i][k] - self.cepstral_mem[j][k];
-                    dist += tmp * tmp;
-                }
                 if j != i {
-                    min_dist = min_dist.min(dist);
+                    min_dist = min_dist.min(self.ceps_dist[i][j]);
                 }
             }
             spec_variability += min_dist;
@@ -233,15 +339,7 @@ impl DenoiseFeatures {
             r[i] *= (self.ex[i] / (1e-8 + self.ep[i])).sqrt();
         }
         crate::interp_band_gain(&mut rf[..], &r[..]);
-        let rf: &mut [f32] = &mut rf;
-        *self.x.get_offset_mut() += self.p.get_offset() * rf[0];
-        for ((x, p), rf) in self
-            .x
-            .get_frequency_bins_mut()
-            .iter_mut()
-            .zip(self.p.get_frequency_bins())
-            .zip(rf[1..].iter())
-        {
+        for ((x, p), &rf) in self.x.iter_mut().zip(&self.p).zip(rf.iter()) {
             *x += p * rf;
         }
 
@@ -251,22 +349,39 @@ impl DenoiseFeatures {
             r[i] = (self.ex[i] / (1e-8 + new_e[i])).sqrt();
         }
         crate::interp_band_gain(&mut rf[..], &r[..]);
-        self.x *= &*rf;
+        for (x, &rf) in self.x.iter_mut().zip(rf.iter()) {
+            *x *= rf;
+        }
     }
 
     pub(crate) fn apply_gain(&mut self, gain: &[f32; FREQ_SIZE]) {
-        self.x *= gain as &[f32];
+        for (x, &g) in self.x.iter_mut().zip(gain.iter()) {
+            *x *= g;
+        }
+    }
+
+    /// Hands out the current spectrum so that a caller can hold on to it while it computes
+    /// gains from later frames. Used by the lookahead path.
+    pub(crate) fn swap_spectrum(&mut self, other: &mut Vec<Complex>) {
+        std::mem::swap(&mut self.x, other);
     }
 
     pub(crate) fn frame_synthesis(&mut self, out: &mut [f32]) {
         assert_eq!(out.len(), FRAME_SIZE);
-        self.x.real_ifft_using(&mut self.window_buf);
-        // Not too sure why this scaling factor is introduced
-        for x in &mut self.window_buf {
-            *x /= 2.0;
-        }
 
-        crate::apply_window_in_place(&mut self.window_buf[..]);
+        // The inverse transform requires a purely real DC and Nyquist bin. Everything we do to
+        // the spectrum scales it by real gains, so this only guards against rounding.
+        self.x[0].im = 0.0;
+        let last = self.x.len() - 1;
+        self.x[last].im = 0.0;
+
+        self.inv
+            .process_with_scratch(&mut self.x, &mut self.window_buf, &mut self.fft_scratch)
+            .expect("inverse FFT buffers are sized at construction");
+
+        // The synthesis window carries the inverse transform's normalization, so no separate
+        // scaling pass is needed here.
+        crate::apply_synthesis_window_in_place(&mut self.window_buf[..]);
         for (i, sample) in out.iter_mut().enumerate() {
             *sample = self.window_buf[i] + self.synthesis_mem[i];
             self.synthesis_mem[i] = self.window_buf[FRAME_SIZE + i];
@@ -287,17 +402,119 @@ fn transform_input(
     input: &[f32],
     lag: usize,
     window_buf: &mut [f32; WINDOW_SIZE],
-    x: &mut DynRealDft<f32>,
+    x: &mut [Complex],
     ex: &mut [f32],
+    fwd: &Arc<dyn RealToComplex<f32>>,
+    scratch: &mut [Complex],
 ) {
     let input = &input[input.len().checked_sub(WINDOW_SIZE + lag).unwrap()..];
     crate::apply_window(&mut window_buf[..], input);
-    window_buf.real_fft_using(x);
+    fwd.process_with_scratch(&mut window_buf[..], x, scratch)
+        .expect("forward FFT buffers are sized at construction");
 
     // In the original RNNoise code, the forward transform is normalized and the inverse
-    // tranform isn't. `rustfft` doesn't normalize either one, so we do it ourselves.
-    let norm = common().wnorm;
-    *x *= norm;
+    // tranform isn't. `realfft` doesn't normalize either one, so we do it ourselves.
+    let norm = common().wnorm();
+    for v in x.iter_mut() {
+        *v *= norm;
+    }
 
     crate::compute_band_corr(ex, x, x);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ramp(offset: f32) -> Vec<f32> {
+        (0..FRAME_SIZE)
+            .map(|i| (i as f32 * 0.05 + offset).sin() * 5000.0)
+            .collect()
+    }
+
+    /// The amortized history buffer must present the same window as a naive shift-down would.
+    #[test]
+    fn history_window_matches_a_naive_shift() {
+        let mut feat = DenoiseFeatures::new();
+        let mut naive = vec![0.0f32; PITCH_BUF_SIZE];
+
+        // Run past the point where compaction has to happen at least twice.
+        for k in 0..(HISTORY_SLACK_FRAMES * 3 + 1) {
+            let frame = ramp(k as f32);
+            feat.shift_input(&frame);
+
+            naive.copy_within(FRAME_SIZE.., 0);
+            naive[(PITCH_BUF_SIZE - FRAME_SIZE)..].copy_from_slice(&frame);
+
+            assert_eq!(feat.history(), &naive[..], "mismatch after frame {k}");
+        }
+    }
+
+    /// A round trip with unit gains must reconstruct the input, which is what proves the
+    /// normalization folded into the synthesis window is right.
+    #[test]
+    fn unit_gain_round_trip_reconstructs_the_input() {
+        let mut feat = DenoiseFeatures::new();
+        let gain = [1.0; FREQ_SIZE];
+        let mut out = vec![0.0; FRAME_SIZE];
+
+        let frames: Vec<Vec<f32>> = (0..4).map(|k| ramp(k as f32 * 7.0)).collect();
+        for (k, frame) in frames.iter().enumerate() {
+            feat.shift_input(frame);
+            feat.compute_frame_features();
+            feat.apply_gain(&gain);
+            feat.frame_synthesis(&mut out);
+
+            // Output lags the input by exactly one frame.
+            if k >= 1 {
+                let expected = &frames[k - 1];
+                for (i, (&got, &want)) in out.iter().zip(expected).enumerate() {
+                    assert!(
+                        (got - want).abs() < 1.0,
+                        "frame {k} sample {i}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The cached distance matrix has to agree with recomputing it from scratch.
+    #[test]
+    fn cached_cepstral_distances_match_a_full_recomputation() {
+        let mut feat = DenoiseFeatures::new();
+        for k in 0..20 {
+            feat.shift_input(&ramp(k as f32 * 3.0));
+            feat.compute_frame_features();
+
+            for i in 0..CEPS_MEM {
+                for j in 0..CEPS_MEM {
+                    let mut want = 0.0;
+                    for b in 0..NB_BANDS {
+                        let d = feat.cepstral_mem[i][b] - feat.cepstral_mem[j][b];
+                        want += d * d;
+                    }
+                    let got = feat.ceps_dist[i][j];
+                    assert!(
+                        (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                        "frame {k}, dist[{i}][{j}]: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_returns_to_the_initial_state() {
+        let mut feat = DenoiseFeatures::new();
+        for k in 0..12 {
+            feat.shift_and_filter_input(&ramp(k as f32));
+            feat.compute_frame_features();
+        }
+        feat.reset();
+
+        let fresh = DenoiseFeatures::new();
+        assert_eq!(feat.history(), fresh.history());
+        assert_eq!(feat.features(), fresh.features());
+        assert_eq!(feat.mem_id, fresh.mem_id);
+    }
 }

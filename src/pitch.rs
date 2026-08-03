@@ -46,6 +46,14 @@ impl PitchFinder {
         }
     }
 
+    /// The most recently detected period and gain, without doing any new work.
+    ///
+    /// This is what [`crate::DenoiseParams::pitch_interval`] reuses on the frames where the
+    /// search is skipped.
+    pub(crate) fn last(&self) -> (usize, f32) {
+        (self.last_period, self.last_gain)
+    }
+
     /// Finds the main pitch of an audio signal, and also something gain something something.
     ///
     /// `input` is a buffer of size `PITCH_BUF_SIZE`
@@ -77,6 +85,7 @@ impl PitchFinder {
         let x_lp4 = &mut self.scratch2[..(len / 4)];
         let y_lp4 = &mut self.scratch[..(len / 4 + max_pitch / 4)];
         let xcorr = &mut self.scratch3[..];
+        let k = &crate::common().kernels;
 
         // The signal in `self.pitch_buf` was already downsampled by a factor of 2. Downsample it
         // again.
@@ -88,7 +97,7 @@ impl PitchFinder {
         }
 
         // Use brute-force for the 4x downsampled data.
-        pitch_xcorr(&x_lp4, &y_lp4, &mut xcorr[0..(max_pitch / 4)]);
+        (k.xcorr)(&x_lp4, &y_lp4, &mut xcorr[0..(max_pitch / 4)]);
         let (best_pitch, second_best_pitch) =
             find_best_pitch(&xcorr[0..(max_pitch / 4)], &y_lp4, len / 4);
 
@@ -123,7 +132,12 @@ impl PitchFinder {
         (2 * best_pitch as isize - offset) as usize
     }
 
-    // TODO: document this.
+    // Rejects pitch estimates that landed on a multiple of the true period.
+    //
+    // The search above maximizes correlation, and a signal with period T also correlates well
+    // at 2T, 3T, and so on. This walks the candidate divisors T/k, accepting a shorter period
+    // when its correlation is close enough to the best one, with a bias against very short
+    // periods (which show up spuriously from short-term correlation).
     fn remove_doubling(&mut self, pitch_idx: usize) -> (usize, f32) {
         let x = &self.pitch_buf[..];
 
@@ -143,10 +157,13 @@ impl PitchFinder {
         let mut xy = inner_prod(&x[max_period..], &x[(max_period - t0)..], n);
         yy_lookup[0] = xx;
 
+        // A sliding-window energy: dropping the sample that leaves the window and adding the
+        // one that enters, so each lag costs two multiplies instead of a full inner product.
         let mut yy = xx;
         for i in 1..=max_period {
-            yy += x[max_period - i] * x[max_period - i]
-                - x[max_period + n - i] * x[max_period + n - i];
+            let entering = x[max_period - i];
+            let leaving = x[max_period + n - i];
+            yy += entering * entering - leaving * leaving;
             yy_lookup[i] = yy.max(0.0);
         }
 
@@ -231,25 +248,9 @@ impl PitchFinder {
 }
 
 /// Computes the inner product of `xs[..n]` and `ys[..n]`.
+#[inline]
 fn inner_prod(xs: &[f32], ys: &[f32], n: usize) -> f32 {
-    let mut sum0 = 0.0;
-    let mut sum1 = 0.0;
-    let mut sum2 = 0.0;
-    let mut sum3 = 0.0;
-
-    let n_4 = n - n % 4;
-    for (x, y) in xs[..n_4].chunks_exact(4).zip(ys[..n_4].chunks_exact(4)) {
-        sum0 += x[0] * y[0];
-        sum1 += x[1] * y[1];
-        sum2 += x[2] * y[2];
-        sum3 += x[3] * y[3];
-    }
-
-    let mut sum = sum0 + sum1 + sum2 + sum3;
-    for (&x, &y) in xs[n_4..n].iter().zip(&ys[n_4..n]) {
-        sum += x * y;
-    }
-    sum
+    (crate::common().kernels.dot)(&xs[..n], &ys[..n])
 }
 
 /// Does linear predictive coding (LPC) for a signal. The LPC coefficients are put into `lpc`,
@@ -297,77 +298,6 @@ fn lpc(lpc: &mut [f32], ac: &[f32]) {
         if error < 0.001 * ac[0] {
             return;
         }
-    }
-}
-
-/// Computes various terms of the cross-correlation between x and y (the number of terms to compute
-/// is determined by the size of `xcorr`).
-fn pitch_xcorr(xs: &[f32], ys: &[f32], xcorr: &mut [f32]) {
-    // The un-optimized version of this function is:
-    //
-    // for i in 0..xcorr.len() {
-    //    xcorr[i] = xs.iter().zip(&ys[i..]).map(|(&x, &y)| x * y).sum();
-    // }
-    //
-    // To optimize it, we unroll both the outer and inner loops four times each. This is a huge win
-    // because it improves the pattern of access to ys. The compiler does a good job of vectorizing
-    // the inner loop. (Maybe if we unrolled 8 times, it would be better on AVX?)
-
-    let xcorr_len_4 = xcorr.len() - xcorr.len() % 4;
-    let xs_len_4 = xs.len() - xs.len() % 4;
-
-    for i in (0..xcorr_len_4).step_by(4) {
-        let mut c0 = 0.0;
-        let mut c1 = 0.0;
-        let mut c2 = 0.0;
-        let mut c3 = 0.0;
-
-        let mut y0 = ys[i + 0];
-        let mut y1 = ys[i + 1];
-        let mut y2 = ys[i + 2];
-        let mut y3 = ys[i + 3];
-
-        for (x, y) in xs.chunks_exact(4).zip(ys[(i + 4)..].chunks_exact(4)) {
-            c0 += x[0] * y0;
-            c1 += x[0] * y1;
-            c2 += x[0] * y2;
-            c3 += x[0] * y3;
-
-            y0 = y[0];
-            c0 += x[1] * y1;
-            c1 += x[1] * y2;
-            c2 += x[1] * y3;
-            c3 += x[1] * y0;
-
-            y1 = y[1];
-            c0 += x[2] * y2;
-            c1 += x[2] * y3;
-            c2 += x[2] * y0;
-            c3 += x[2] * y1;
-
-            y2 = y[2];
-            c0 += x[3] * y3;
-            c1 += x[3] * y0;
-            c2 += x[3] * y1;
-            c3 += x[3] * y2;
-
-            y3 = y[3];
-        }
-
-        for j in xs_len_4..xs.len() {
-            c0 += xs[j] * ys[i + 0 + j];
-            c1 += xs[j] * ys[i + 1 + j];
-            c2 += xs[j] * ys[i + 2 + j];
-            c3 += xs[j] * ys[i + 3 + j];
-        }
-        xcorr[i + 0] = c0;
-        xcorr[i + 1] = c1;
-        xcorr[i + 2] = c2;
-        xcorr[i + 3] = c3;
-    }
-
-    for i in xcorr_len_4..xcorr.len() {
-        xcorr[i] = xs.iter().zip(&ys[i..]).map(|(&x, &y)| x * y).sum();
     }
 }
 
@@ -443,7 +373,7 @@ fn celt_autocorr(x: &[f32], ac: &mut [f32]) {
     let n = x.len();
     let lag = ac.len() - 1;
     let fast_n = n - lag;
-    pitch_xcorr(&x[0..fast_n], x, ac);
+    (crate::common().kernels.xcorr)(&x[0..fast_n], x, ac);
 
     for k in 0..ac.len() {
         let mut d = 0.0;
@@ -501,12 +431,17 @@ const SECOND_CHECK: [usize; 16] = [0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3, 
 mod tests {
     use super::*;
 
-    #[test]
-    fn tracks_a_periodic_signal() {
+    fn periodic(period: f32) -> [f32; PITCH_BUF_SIZE] {
         let mut input = [0.0; PITCH_BUF_SIZE];
         for (i, sample) in input.iter_mut().enumerate() {
-            *sample = (2.0 * std::f32::consts::PI * i as f32 / 240.0).sin() * 10_000.0;
+            *sample = (2.0 * std::f32::consts::PI * i as f32 / period).sin() * 10_000.0;
         }
+        input
+    }
+
+    #[test]
+    fn tracks_a_periodic_signal() {
+        let input = periodic(240.0);
 
         let mut finder = PitchFinder::new();
         let (period, gain) = finder.process(&input);
@@ -515,5 +450,42 @@ mod tests {
             "detected period: {period}"
         );
         assert!(gain > 0.5, "detected gain: {gain}");
+    }
+
+    /// The search must land on the fundamental, not on an octave of it.
+    #[test]
+    fn tracks_several_periods_without_octave_errors() {
+        for &p in &[120.0f32, 180.0, 240.0, 320.0] {
+            let mut finder = PitchFinder::new();
+            let input = periodic(p);
+            let (period, _) = finder.process(&input);
+            assert!(
+                (period as f32 - p).abs() <= 0.05 * p,
+                "period {p}: detected {period}"
+            );
+        }
+    }
+
+    /// Skipping the search must hand back exactly what the last real search found.
+    #[test]
+    fn last_reports_the_previous_result() {
+        let mut finder = PitchFinder::new();
+        assert_eq!(finder.last(), (0, 0.0));
+        let got = finder.process(&periodic(240.0));
+        assert_eq!(finder.last(), got);
+    }
+
+    /// Noise has no pitch; the reported gain should stay low.
+    #[test]
+    fn unvoiced_input_reports_low_gain() {
+        let mut seed = 12345u32;
+        let mut input = [0.0; PITCH_BUF_SIZE];
+        for sample in input.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *sample = ((seed >> 16) as i32 - 32768) as f32 / 4.0;
+        }
+        let mut finder = PitchFinder::new();
+        let (_, gain) = finder.process(&input);
+        assert!(gain < 0.5, "detected gain: {gain}");
     }
 }
