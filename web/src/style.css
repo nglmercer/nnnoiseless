@@ -45,18 +45,14 @@ body {
     Helvetica, Arial, sans-serif;
 }
 
-code {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.9em;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  padding: 0.1em 0.35em;
-  border-radius: 4px;
-}
-
 .topbar {
   max-width: 900px;
   margin: 0 auto;
   padding: 2.5rem 0 1.5rem;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
 }
 
 .topbar h1 {
@@ -65,39 +61,101 @@ code {
   letter-spacing: -0.02em;
 }
 
-.tagline {
-  margin: 0.35rem 0 1.25rem;
+.info-popover,
+.field-help,
+.heading-help {
+  position: relative;
+}
+
+.info-button {
+  display: inline-grid;
+  place-items: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: transparent;
   color: var(--muted);
+  font: 600 0.75rem/1 ui-sans-serif, system-ui, sans-serif;
+  cursor: help;
 }
 
-.badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin: 0;
+.info-button:hover,
+.info-button:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
 }
 
-.badges > div {
-  display: flex;
-  align-items: baseline;
-  gap: 0.4rem;
+.info-panel,
+.tooltip {
+  position: absolute;
+  z-index: 10;
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-0.25rem);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 0.25rem 0.8rem;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--text) 14%, transparent);
 }
 
-.badges dt {
+.info-panel {
+  top: calc(100% + 0.6rem);
+  right: 0;
+  display: grid;
+  gap: 0.5rem;
+  min-width: 11rem;
+  margin: 0;
+  padding: 0.7rem 0.8rem;
+}
+
+.info-panel > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.info-panel dt {
   color: var(--muted);
   font-size: 0.8rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
-.badges dd {
+.info-panel dd {
   margin: 0;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+
+.tooltip {
+  top: calc(100% + 0.5rem);
+  right: 0;
+  width: max-content;
+  max-width: 15rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.heading-help .tooltip {
+  top: calc(100% + 0.5rem);
+}
+
+.info-popover:hover .info-panel,
+.info-popover:focus-within .info-panel,
+.field-help:hover .tooltip,
+.field-help:focus-within .tooltip,
+.heading-help:hover .tooltip,
+.heading-help:focus-within .tooltip {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
 }
 
 #badge-status.ok {
@@ -126,12 +184,6 @@ main {
   font-size: 1.05rem;
 }
 
-.hint {
-  margin: 0 0 1.1rem;
-  color: var(--muted);
-  font-size: 0.92rem;
-}
-
 .controls {
   display: grid;
   gap: 1.1rem;
@@ -151,15 +203,22 @@ main {
   font-weight: 600;
 }
 
-.label-row output {
+.label-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.label-actions output {
   color: var(--accent);
   font-variant-numeric: tabular-nums;
   font-weight: 700;
 }
 
-.controls small {
-  color: var(--muted);
-  font-size: 0.82rem;
+.heading-help {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 0.35rem;
 }
 
 input[type='range'] {
@@ -174,11 +233,7 @@ input[type='range'] {
   gap: 0.75rem;
 }
 
-.spacer {
-  flex: 1;
-}
-
-button {
+button:not(.info-button) {
   font: inherit;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -269,20 +324,6 @@ button.ghost {
   margin-bottom: 0.4rem;
 }
 
-.swatch {
-  width: 0.7rem;
-  height: 0.7rem;
-  border-radius: 3px;
-  display: inline-block;
-}
-
-.swatch-before {
-  background: var(--wave-before);
-}
-.swatch-after {
-  background: var(--wave-after);
-}
-
 canvas {
   width: 100%;
   display: block;
@@ -331,9 +372,14 @@ canvas {
   font-size: 0.9rem;
 }
 
-footer {
-  max-width: 900px;
-  margin: 2.5rem auto 0;
-  color: var(--muted);
-  font-size: 0.85rem;
+@media (max-width: 640px) {
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .info-panel {
+    right: auto;
+    left: 0;
+  }
 }

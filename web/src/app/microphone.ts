@@ -107,6 +107,7 @@ export async function startMic(): Promise<void> {
       if (msg.type === 'vad') {
         const pct = Math.max(0, Math.min(1, msg.value));
         ui.vadMeter.style.width = `${(pct * 100).toFixed(1)}%`;
+        ui.vadMeter.parentElement?.setAttribute('aria-valuenow', pct.toFixed(2));
         ui.vadValue.textContent = pct.toFixed(2);
       } else if (msg.type === 'ready') {
         ui.mic.disabled = false;
@@ -151,6 +152,7 @@ export function stopMic(): void {
   ui.mic.textContent = 'Start microphone';
   ui.mic.classList.remove('danger');
   ui.vadMeter.style.width = '0%';
+  ui.vadMeter.parentElement?.setAttribute('aria-valuenow', '0');
   ui.vadValue.textContent = '0.00';
 }
 
