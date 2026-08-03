@@ -174,6 +174,8 @@ if (hushModelPath) {
   let phase = 0;
   const hushFrames = 2_000; // 20 seconds at 16 kHz
   let hushProduced = 0;
+  let hushOutputFinite = true;
+  let hushLsnrFinite = true;
   const processStarted = performance.now();
   for (let frame = 0; frame < hushFrames; frame += 1) {
     for (let i = 0; i < hushFrame.length; i += 1) {
@@ -182,8 +184,8 @@ if (hushModelPath) {
     }
     const out = hush.push(hushFrame);
     hushProduced += out.length;
-    check('Hush output is finite', out.every(Number.isFinite));
-    if (!Number.isFinite(hush.lsnrDb)) check('Hush L-SNR is finite', false);
+    hushOutputFinite &&= out.every(Number.isFinite);
+    hushLsnrFinite &&= Number.isFinite(hush.lsnrDb);
   }
   const processMs = performance.now() - processStarted;
   const audioSeconds = (hushFrames * hush.frameSize) / hush.sampleRate;
@@ -192,6 +194,8 @@ if (hushModelPath) {
       `(${((processMs * 1000) / hushFrames).toFixed(1)} us/frame, ` +
       `${(audioSeconds / (processMs / 1000)).toFixed(2)}x realtime)`,
   );
+  check('Hush output is finite', hushOutputFinite);
+  check('Hush L-SNR is finite', hushLsnrFinite);
   check('Hush streaming produces delayed output', hushProduced > 0, `${hushProduced} samples`);
   hush.reset();
   hush.free();

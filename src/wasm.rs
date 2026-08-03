@@ -341,8 +341,7 @@ impl HushDenoiser {
         self.pending.extend_from_slice(input);
         let frame_size = self.frame_size();
         while self.pending.len() >= frame_size {
-            self.frame_in
-                .copy_from_slice(&self.pending[..frame_size]);
+            self.frame_in.copy_from_slice(&self.pending[..frame_size]);
             self.pending.drain(..frame_size);
             self.lsnr_db = self
                 .state
@@ -375,8 +374,7 @@ impl HushDenoiser {
         self.pending.clear();
         self.ready.clear();
         self.lsnr_db = -15.0;
-        self.warmup = (self.state.latency_samples() + self.frame_size() - 1)
-            / self.frame_size();
+        self.warmup = (self.state.latency_samples() + self.frame_size() - 1) / self.frame_size();
         Ok(())
     }
 }

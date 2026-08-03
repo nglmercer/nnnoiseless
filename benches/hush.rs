@@ -22,18 +22,12 @@ fn make_input() -> Vec<f32> {
             let white = ((seed >> 16) as i32 - 32768) as f32 / 32768.0;
             lp = 0.85 * lp + 0.15 * white;
             let t = i as f32 / HUSH_SAMPLE_RATE as f32;
-            let env = (0.5
-                + 0.5 * (2.0 * std::f32::consts::PI * 3.0 * t).sin())
+            let env = (0.5 + 0.5 * (2.0 * std::f32::consts::PI * 3.0 * t).sin())
                 .max(0.0)
                 .powf(1.5);
             let mut speech = 0.0;
             for harmonic in 1..=12 {
-                speech += (2.0
-                    * std::f32::consts::PI
-                    * 150.0
-                    * harmonic as f32
-                    * t)
-                    .sin()
+                speech += (2.0 * std::f32::consts::PI * 150.0 * harmonic as f32 * t).sin()
                     / (harmonic as f32).powf(1.2);
             }
             speech * env * 0.08 + (white * 0.5 + lp * 2.0) * 0.03

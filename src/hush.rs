@@ -95,17 +95,11 @@ impl HushModel {
             ));
         }
 
-        let runtime = RuntimeParams::new(
-            1,
-            false,
-            attenuation_db,
-            -15.0,
-            35.0,
-            35.0,
-            ReduceMask::MAX,
-        );
-        let runtime = DfTract::new(self.params.clone(), &runtime)
-            .map_err(|error| HushError::new(format!("could not initialize Hush runtime: {error}")))?;
+        let runtime =
+            RuntimeParams::new(1, false, attenuation_db, -15.0, 35.0, 35.0, ReduceMask::MAX);
+        let runtime = DfTract::new(self.params.clone(), &runtime).map_err(|error| {
+            HushError::new(format!("could not initialize Hush runtime: {error}"))
+        })?;
 
         if runtime.sr != HUSH_SAMPLE_RATE || runtime.hop_size != HUSH_FRAME_SIZE {
             return Err(HushError::new(format!(
@@ -155,11 +149,7 @@ impl HushDenoiser {
     }
 
     /// Processes one normalized 10 ms mono frame and returns its local-SNR estimate.
-    pub fn process_frame(
-        &mut self,
-        output: &mut [f32],
-        input: &[f32],
-    ) -> Result<f32, HushError> {
+    pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> Result<f32, HushError> {
         if input.len() != self.frame_size || output.len() != self.frame_size {
             return Err(HushError::new(format!(
                 "Hush frames must contain {} samples (input {}, output {})",

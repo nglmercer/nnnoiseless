@@ -414,6 +414,46 @@ models to port into a small, allocation-free Rust/WASM library.
    latency. The [DNS Challenge tools](https://github.com/microsoft/DNS-Challenge)
    are a useful starting point for reproducible noisy-speech evaluation.
 
+### Hush backend (opt-in)
+
+This branch includes a Hush backend built on the released DeepFilterNet 0.5.3
+Tract runtime. It loads Hush's `advanced_dfnet16k_model_best_onnx.tar.gz`
+bundle at runtime and keeps the existing RNNoise path unchanged. Hush accepts
+normalized mono `f32` samples at 16 kHz in 160-sample frames, while the
+RNNoise API continues to use the crate's 48 kHz, signed-16-bit-scaled contract.
+
+```rust
+use nnnoiseless::{HushModel, HUSH_FRAME_SIZE};
+
+let model = HushModel::from_path("advanced_dfnet16k_model_best_onnx.tar.gz")?;
+let mut hush = model.denoiser()?;
+let input = [0.0f32; HUSH_FRAME_SIZE];
+let mut output = [0.0f32; HUSH_FRAME_SIZE];
+let lsnr_db = hush.process_frame(&mut output, &input)?;
+# let _ = lsnr_db;
+```
+
+Verify the native backend and measure its streaming cost with the released
+bundle:
+
+```bash
+HUSH_MODEL=/path/to/advanced_dfnet16k_model_best_onnx.tar.gz \
+  cargo test --features hush --test hush
+HUSH_MODEL=/path/to/advanced_dfnet16k_model_best_onnx.tar.gz \
+  cargo bench --features hush --bench hush
+```
+
+The Hush WebAssembly bindings expose `HushDenoiser.fromModelBytes` and
+`denoiseHushBuffer`. The browser build includes the Tract runtime but not the
+8 MB model; the Vite demo has a model-bundle picker and a separate Hush
+microphone path that requests a 16 kHz `AudioContext`:
+
+```bash
+cd web
+npm run wasm
+HUSH_MODEL=/path/to/advanced_dfnet16k_model_best_onnx.tar.gz npm test
+```
+
 ## In the browser
 
 The crate compiles to WebAssembly, and `web/` holds a Vite demo that denoises
