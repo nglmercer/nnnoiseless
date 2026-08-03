@@ -78,7 +78,9 @@ and both paths share the same ~441 kB download (~208 kB gzipped).
 ## Layout
 
 - `index.html` — page structure;
-- `src/main.ts` — wiring, clip processing, waveform drawing, mic setup;
+- `src/main.ts` — application wiring and initialization;
+- `src/app/` — focused modules for UI/state, settings, clips, waveforms,
+  playback, and microphone setup;
 - `src/denoise-worklet.ts` — the typed `AudioWorkletProcessor`;
 - `src/style.css` — styling, light and dark;
 - `src/audio-worklet.d.ts` — the missing Web Audio worklet globals;
