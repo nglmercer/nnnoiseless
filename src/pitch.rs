@@ -496,3 +496,24 @@ fn pitch_gain(xy: f32, xx: f32, yy: f32) -> f32 {
 }
 
 const SECOND_CHECK: [usize; 16] = [0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3, 2];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracks_a_periodic_signal() {
+        let mut input = [0.0; PITCH_BUF_SIZE];
+        for (i, sample) in input.iter_mut().enumerate() {
+            *sample = (2.0 * std::f32::consts::PI * i as f32 / 240.0).sin() * 10_000.0;
+        }
+
+        let mut finder = PitchFinder::new();
+        let (period, gain) = finder.process(&input);
+        assert!(
+            (period as isize - 240).abs() <= 4,
+            "detected period: {period}"
+        );
+        assert!(gain > 0.5, "detected gain: {gain}");
+    }
+}
