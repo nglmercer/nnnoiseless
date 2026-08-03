@@ -1,4 +1,4 @@
-import { denoiseBuffer } from '../pkg/nnnoiseless.js';
+import { denoiseBuffer, denoiseHushBuffer } from '../pkg/nnnoiseless.js';
 import { audioContext } from './audio';
 import { settings } from './settings';
 import { state } from './state';
@@ -301,18 +301,26 @@ export function processClip(): void {
   const { samples, sampleRate } = state.clip;
   const current = settings();
 
+  if (current.backend === 'hush' && !state.hushModel) {
+    ui.processTime.textContent = 'Load a Hush model bundle first';
+    return;
+  }
+
   const started = performance.now();
-  state.denoised = denoiseBuffer(
-    samples,
-    sampleRate,
-    current.attenuationDb,
-    current.vadThreshold,
-    current.lookahead,
-  );
+  state.denoised =
+    current.backend === 'hush'
+      ? denoiseHushBuffer(samples, sampleRate, current.attenuationDb, state.hushModel!)
+      : denoiseBuffer(
+          samples,
+          sampleRate,
+          current.attenuationDb,
+          current.vadThreshold,
+          current.lookahead,
+        );
   const elapsed = performance.now() - started;
 
   const audioSeconds = samples.length / sampleRate;
-  ui.processTime.textContent = `${elapsed.toFixed(0)} ms for ${audioSeconds.toFixed(
+  ui.processTime.textContent = `${current.backend} — ${elapsed.toFixed(0)} ms for ${audioSeconds.toFixed(
     1,
   )}s (${(audioSeconds / (elapsed / 1000)).toFixed(0)}x realtime)`;
 

@@ -273,6 +273,147 @@ gains. Above roughly 7 dB input SNR the reshaping costs more waveform accuracy
 than the removed noise is worth. This is expected, and is why the quality tests
 only require improvement below that point.
 
+## Recommended next improvements
+
+The current implementation already covers the obvious baseline optimizations:
+runtime SIMD dispatch, cached FFT plans, widened model weights, amortized input
+history, and pitch-search decimation. The next changes should be measured against
+both output quality and the included benchmark. Keep
+`DenoiseParams::default()` compatible with the original RNNoise path; expose
+experimental behaviour as an opt-in preset or parameter until it has been
+validated on real recordings.
+
+### Improve denoising quality
+
+1. **Evaluate and train against real recordings.** `tests/quality.rs` is a fast,
+   deterministic smoke test built from synthetic speech-like signals. Add an
+   opt-in evaluation harness with licensed speech, stationary and changing noise,
+   reverberation, music, transients, and clean speech. Track noise reduction,
+   speech loss, SI-SDR/segmental SNR, onset preservation, VAD accuracy, and
+   latency. Use the resulting train/validation split to fine-tune a custom
+   `RnnModel` for the target microphone or application; structural model parsing
+   alone cannot guarantee that a model is well calibrated.
+
+2. **Add an explicit noise-only strategy.** The RNNoise-style model is trained to
+   separate speech from noise, so its VAD can be fooled by noise without speech.
+   A noise profile/calibration mode, a conservative stationary-noise estimator,
+   or a separately trained non-speech detector would address this case. Raising
+   `vad_threshold` is not a sufficient fix because it relies on the same VAD.
+
+3. **Protect clean speech and transients.** Add an opt-in adaptive bypass or
+   dry/wet mix when the input is already clean, and validate it on high-SNR speech
+   rather than assuming more suppression is better. For live audio, offer a
+   bounded onset hangover or one/two-frame lookahead mode when the application can
+   afford the extra latency; the existing `lookahead` path is mainly intended for
+   offline processing.
+
+4. **Make multichannel decisions spatially coherent.** `ChannelLink::Max` is a
+   safe stereo baseline, but every channel still performs its own analysis and
+   recurrent inference. A shared reference (for example, a validated mid/beam
+   signal) with linked gains could reduce wandering and preserve stereo imaging;
+   compare it against `Independent`, `Max`, and `Mean` on phase, localization,
+   speech loss, and noise reduction before changing the default.
+
+### Improve CPU and browser performance
+
+1. **Skip expensive analysis on silence.** `compute_frame_features_with` currently
+   performs the pitch search and a second FFT before checking the low-energy
+   condition that ultimately marks a frame silent. Move the early-silence decision
+   immediately after the first FFT's band energies, while preserving frame-count
+   and state semantics. This should help voice-chat workloads with long pauses;
+   add a silence-heavy benchmark and regression test.
+
+2. **Fuse the GRU matrix-vector products.** `src/rnn.rs` currently evaluates the
+   three gates with separate input and recurrent matvec calls. Pack the gate
+   weights in the hot layout and use fused kernels for the shared input gates and
+   the update/reset recurrent gates, leaving the candidate recurrent product after
+   the reset activation. Preserve a scalar/reference path and compare numerical
+   drift, quality metrics, and per-frame latency before accepting the change.
+
+3. **Remove per-frame multichannel and CLI overhead.** The CLI builds temporary
+   `Vec<&[f32]>` and `Vec<&mut [f32]>` values for every frame, then deinterleaves
+   and reinterleaves samples. Reuse those views or add an interleaved-frame API to
+   `MultiDenoiser`. Also replace the byte-at-a-time RAW decoder with block reads;
+   these changes improve throughput without changing the DSP result.
+
+4. **Make resampling a specialized fast path.** The sinc resampler is much more
+   expensive than the 48 kHz denoiser for non-48 kHz input. Add a true identity
+   copy path, replace `Vec::drain` history movement with a ring buffer, and use
+   precomputed polyphase coefficients for common ratios such as 16↔48 kHz. Keep
+   alias rejection, passband level, output length, and channel-isolation tests.
+
+5. **Make the WebAssembly streaming path allocation-free.** `Denoiser::push`
+   shifts `pending`, drains `ready`, and allocates a returned `Vec` for each
+   AudioWorklet block. Add a ring-buffer implementation and a caller-provided
+   `push_into`/output-buffer API so the real-time worklet does not create garbage
+   or risk a GC pause on the audio thread. Keep `simd128` enabled and compare
+   bundle size, worklet underruns, and realtime factor.
+
+### Rollout and measurement
+
+For every quality change, keep the regression fixtures and add real-recording
+results before changing defaults. For every performance change, run
+`cargo bench` with the active ISA recorded, compare 48 kHz denoising separately
+from resampling and multichannel scaling, and check the `reference`,
+`low-memory`, and WebAssembly builds. A change is ready when it improves its
+target metric without exceeding the agreed speech-loss, latency, memory, or
+numerical-drift budget.
+
+## Denoiser model survey (2026)
+
+Survey date: 2026-08-03. No public catalogue is literally exhaustive, so this
+is an implementation-oriented shortlist of models and architectures with public
+papers, code, or weights. Published quality scores are not directly comparable
+across datasets. The existing RNNoise model should remain the default until a
+replacement is measured on the same recordings and latency budget.
+
+### Candidates worth implementing
+
+| Priority | Candidate | Why it is interesting | Possible integration | Main risk |
+| --- | --- | --- | --- | --- |
+| 1 | [GTCRN](https://github.com/Xiaobin-Rong/gtcrn) | Very small grouped temporal-convolutional recurrent model: 48.2K parameters and 33.0 MMAC/s in the official repository. It includes streaming code and pretrained checkpoints. | Add a native Rust backend with an explicit feature extractor, recurrent state, and model metadata. It is the best first candidate for a small CPU/WASM model after verifying the checkpoint sample rate and tensor layout. | It is not a drop-in RNNoise replacement; the ERB/grouped temporal frontend and checkpoint conversion need to be implemented and validated. |
+| 2 | [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) | Full-band 48 kHz enhancement with a Rust `libDF` runtime, deep filtering, pretrained models, and permissive MIT/Apache-2.0 code licensing. | Reuse or port the Rust frontend/runtime behind a feature-gated backend. This is the strongest quality-oriented fit for this crate's native 48 kHz API. | Larger feature/model pipeline and more state than RNNoise; WASM size and allocations need dedicated work. |
+| 3 | [Time-Varying Filtering (TVF)](https://arxiv.org/abs/2603.02794) | A 2026 low-latency design in which a neural controller predicts coefficients for an interpretable 35-band IIR filter cascade. The paper reports a compact 24K-parameter realization and 10.7 ms latency. | Implement the 35-band filterbank and a small causal controller, then train/export a model in a new compact format. It matches the existing DSP-oriented design better than a large spectrogram network. | The paper does not provide a drop-in implementation or weights; training and reproduction are required. |
+| 4 | [DTLN](https://huggingface.co/alekya/DTLN) | Small dual-signal-transform LSTM with SavedModel, TFLite, and ONNX exports; the model card describes real-time, one-frame-in/one-frame-out operation and fewer than one million parameters. | Add it as an optional 16 kHz ONNX/native backend for voice applications, with an explicit resampling boundary. | It is generally used at 16 kHz, so it is not a native replacement for the current 48 kHz path. |
+| 5 | [LiSenNet](https://huggingface.co/claroche1/LiSenNet) | Ultra-compact causal 16 kHz enhancer with ONNX FP32/static INT8 graphs and an explicit streaming state graph. | Good embedded/INT8 experiment after adding a 16 kHz backend and caller-owned state buffers. | Magnitude-only masking with noisy phase limits quality, and it needs a separate 16 kHz API path. |
+| 6 | [DPDFNet](https://github.com/ceva-ip/DPDFNet) | Stateful streaming models for 8/16/48 kHz with ONNX/TFLite exports. The repository lists a 48 kHz high-resolution model at about 2.58M parameters and 2.42G MACs. | Use as an optional ONNX/TFLite quality backend and benchmark against native models before attempting a Rust port. | It is far heavier than the current denoiser and is unlikely to be a good first pure-Rust or browser implementation. |
+| 7 | [Hush](https://huggingface.co/weya-ai/hush) | Apache-2.0, 16 kHz, about 8 MB, causal, and aimed at suppressing competing speakers in voice-agent audio; its model card reports sub-millisecond CPU processing per 10 ms frame. | Offer it as a voice-agent-specific model/backend, not as the general-purpose default. | It is specialized for interfering speech and 16 kHz input; validate the weights and redistribution terms before bundling them. |
+
+### 2026 research and quality references
+
+These are useful for future backends or design ideas, but are not the first
+models to port into a small, allocation-free Rust/WASM library.
+
+| Model or direction | Useful idea | Implementation decision |
+| --- | --- | --- |
+| [NVIDIA Real-time RE-USE](https://huggingface.co/nvidia/Real-time_RE-USE) | 2026 Mamba-based enhancement with one-frame online inference, 30 latency configurations, and sample rates from 8 to 48 kHz. | Keep as an optional GPU/ONNX benchmark. The NVIDIA noncommercial license and multi-million-parameter runtime make it unsuitable as the bundled default. |
+| [Shell-Core Mamba](https://research.nvidia.com/labs/twn/publication/chime_2026_shellcoremamba/) | 2026 multichannel design that separates local spectral-spatial processing from a causal Mamba core. | Use as a roadmap for spatially coherent stereo/multichannel denoising; wait for portable public weights/code before implementing. |
+| [RT-Tango](https://arxiv.org/abs/2607.01834) | 2026 low-latency binaural design with asymmetric STFTs, online spatial statistics, grouped recurrent masks, and temporal sparsification. | Borrow the latency and spatial-state ideas for a future `MultiDenoiser` backend; the paper is not a drop-in model. |
+| [PercepNet+](https://arxiv.org/abs/2203.02263) | Hybrid DSP/RNN design with an SNR estimator and SNR-switched postprocessing to reduce over-attenuation on clean speech. | High-value design reference for fixing this crate's nearly-clean-input regression before changing the core model. |
+| [Fast FullSubNet+](https://arxiv.org/abs/2212.09019) | Full-band/sub-band fusion with better quality than very small RNNs, while reducing the original FullSubNet cost. | Consider for an optional native/ONNX quality backend; sub-band batching, complex STFT state, and memory traffic are substantial. |
+| [DCCRN](https://arxiv.org/abs/2008.00264) and [FRCRN](https://arxiv.org/abs/2206.07293) | Phase-aware complex or frequency-recurrent mask estimation. | Good quality baselines, but their complex spectrogram pipelines and millions of parameters are too heavy for the first implementation. |
+| [PASE](https://huggingface.co/cisco-ai/pase) and [Clear](https://huggingface.co/desert-ant-labs/clear) | Recent high-quality 16 kHz generative or 48 kHz on-device enhancement options. | Use only as offline/mobile quality references initially; PASE is heavyweight and Clear uses a source-available license that is not equivalent to a permissive model license. |
+| [TokenSE](https://arxiv.org/abs/2604.12246) | 2026 codec-token/Mamba enhancement for cochlear-implant intelligibility. | Research-only for now: a neural codec/token pipeline is outside the current streaming DSP scope. |
+
+### Recommended implementation sequence
+
+1. Add a backend abstraction rather than teaching `RnnModel` every topology. Each
+   backend should declare sample rate, frame/hop size, lookahead, channel mode,
+   state size, input feature layout, output semantics, and quantization format.
+2. Build a native **GTCRN** prototype for the smallest real-time alternative,
+   and a 48 kHz **DeepFilterNet3** prototype for the quality alternative. Keep
+   both behind opt-in features while RNNoise remains the compatibility path.
+3. Add an optional ONNX backend for heavier models such as DPDFNet and RE-USE;
+   do not put their weights in the base crate. Model code and weights have
+   separate licenses and must be reviewed before redistribution.
+4. Prototype TVF only after the evaluation harness exists, because its public
+   paper is an architecture specification rather than a ready-to-run model.
+5. Compare every backend on matched sample rates using speech-plus-stationary
+   noise, nonstationary noise, interfering speech, reverberation, clean speech,
+   noise-only input, realtime factor, allocations, peak memory, and end-to-end
+   latency. The [DNS Challenge tools](https://github.com/microsoft/DNS-Challenge)
+   are a useful starting point for reproducible noisy-speech evaluation.
+
 ## In the browser
 
 The crate compiles to WebAssembly, and `web/` holds a Vite demo that denoises

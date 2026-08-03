@@ -262,3 +262,202 @@ pub fn active_isa_js() -> String {
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
+
+#[cfg(feature = "hush")]
+/// Streaming Hush denoiser for normalized 16 kHz mono audio.
+///
+/// Construct it with [`HushDenoiser::from_model_bytes`]. The model bundle is
+/// the `advanced_dfnet16k_model_best_onnx.tar.gz` artifact from Hush and must
+/// be supplied by the caller so it does not get silently embedded in every
+/// WebAssembly build.
+#[wasm_bindgen]
+pub struct HushDenoiser {
+    state: crate::HushDenoiser,
+    pending: Vec<f32>,
+    ready: Vec<f32>,
+    frame_in: Vec<f32>,
+    frame_out: Vec<f32>,
+    lsnr_db: f32,
+    warmup: usize,
+}
+
+#[cfg(feature = "hush")]
+#[wasm_bindgen]
+impl HushDenoiser {
+    /// Builds a Hush denoiser from an ONNX model bundle held in memory.
+    #[wasm_bindgen(js_name = fromModelBytes)]
+    pub fn from_model_bytes(
+        model_bytes: &[u8],
+        attenuation_limit_db: f32,
+    ) -> Result<HushDenoiser, JsValue> {
+        let model = crate::HushModel::from_bytes(model_bytes).map_err(js_error)?;
+        let attenuation = if attenuation_limit_db > 0.0 {
+            attenuation_limit_db
+        } else {
+            100.0
+        };
+        let state = model
+            .denoiser_with_attenuation_db(attenuation)
+            .map_err(js_error)?;
+        let frame_size = state.frame_size();
+        let warmup = (state.latency_samples() + frame_size - 1) / frame_size;
+        Ok(HushDenoiser {
+            state,
+            pending: Vec::with_capacity(frame_size * 2),
+            ready: Vec::with_capacity(frame_size * 4),
+            frame_in: vec![0.0; frame_size],
+            frame_out: vec![0.0; frame_size],
+            lsnr_db: -15.0,
+            warmup,
+        })
+    }
+
+    /// Hush's sample rate, 16 kHz.
+    #[wasm_bindgen(getter, js_name = sampleRate)]
+    pub fn sample_rate(&self) -> usize {
+        self.state.sample_rate()
+    }
+
+    /// Hush's streaming frame size, 160 samples.
+    #[wasm_bindgen(getter, js_name = frameSize)]
+    pub fn frame_size(&self) -> usize {
+        self.state.frame_size()
+    }
+
+    /// Hush's documented algorithmic delay in samples.
+    #[wasm_bindgen(getter, js_name = latencySamples)]
+    pub fn latency_samples(&self) -> usize {
+        self.state.latency_samples()
+    }
+
+    /// Local-SNR estimate in decibels from the most recently emitted frame.
+    #[wasm_bindgen(getter, js_name = lsnrDb)]
+    pub fn lsnr_db(&self) -> f32 {
+        self.lsnr_db
+    }
+
+    /// Feeds normalized samples in and returns whatever output is ready.
+    pub fn push(&mut self, input: &[f32]) -> Result<Vec<f32>, JsValue> {
+        self.pending.extend_from_slice(input);
+        let frame_size = self.frame_size();
+        while self.pending.len() >= frame_size {
+            self.frame_in
+                .copy_from_slice(&self.pending[..frame_size]);
+            self.pending.drain(..frame_size);
+            self.lsnr_db = self
+                .state
+                .process_frame(&mut self.frame_out, &self.frame_in)
+                .map_err(js_error)?;
+            if self.warmup > 0 {
+                self.warmup -= 1;
+            } else {
+                self.ready.extend_from_slice(&self.frame_out);
+            }
+        }
+
+        let take = self.ready.len().min(input.len());
+        Ok(self.ready.drain(..take).collect())
+    }
+
+    /// Changes the maximum attenuation and resets the stream's processing history.
+    #[wasm_bindgen(js_name = setAttenuationLimitDb)]
+    pub fn set_attenuation_limit_db(&mut self, db: f32) -> Result<(), JsValue> {
+        let attenuation = if db > 0.0 { db } else { 100.0 };
+        self.state
+            .set_attenuation_limit_db(attenuation)
+            .map_err(js_error)?;
+        self.reset()
+    }
+
+    /// Forgets all Hush recurrent, spectral, and overlap-add history.
+    pub fn reset(&mut self) -> Result<(), JsValue> {
+        self.state.reset().map_err(js_error)?;
+        self.pending.clear();
+        self.ready.clear();
+        self.lsnr_db = -15.0;
+        self.warmup = (self.state.latency_samples() + self.frame_size() - 1)
+            / self.frame_size();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "hush")]
+/// Denoises a complete normalized audio buffer with Hush.
+///
+/// The model always runs at 16 kHz. Other input rates are resampled to 16 kHz
+/// and the result is resampled back to the original rate. The returned buffer
+/// has the same length as `samples`.
+#[wasm_bindgen(js_name = denoiseHushBuffer)]
+pub fn denoise_hush_buffer(
+    samples: &[f32],
+    sample_rate: f32,
+    attenuation_limit_db: f32,
+    model_bytes: &[u8],
+) -> Result<Vec<f32>, JsValue> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err(JsValue::from_str("sample rate must be finite and positive"));
+    }
+
+    let rate = sample_rate as f64;
+    let at_16k = if (rate - crate::HUSH_SAMPLE_RATE as f64).abs() < f64::EPSILON {
+        samples.to_vec()
+    } else {
+        let mut resampler = Resampler::new(rate, crate::HUSH_SAMPLE_RATE as f64, 1);
+        let mut converted = Vec::with_capacity(
+            (samples.len() as f64 * crate::HUSH_SAMPLE_RATE as f64 / rate) as usize + 64,
+        );
+        resampler.process(samples, &mut converted);
+        resampler.flush(&mut converted);
+        converted
+    };
+
+    let model = crate::HushModel::from_bytes(model_bytes).map_err(js_error)?;
+    let attenuation = if attenuation_limit_db > 0.0 {
+        attenuation_limit_db
+    } else {
+        100.0
+    };
+    let mut state = model
+        .denoiser_with_attenuation_db(attenuation)
+        .map_err(js_error)?;
+    let frame_size = state.frame_size();
+    let frames = (at_16k.len() + frame_size - 1) / frame_size;
+    let warmup = (state.latency_samples() + frame_size - 1) / frame_size;
+    let at_16k_len = at_16k.len();
+    let mut padded = at_16k;
+    padded.resize(frames * frame_size, 0.0);
+    let mut input = vec![0.0; frame_size];
+    let mut frame_out = vec![0.0; frame_size];
+    let mut enhanced = vec![0.0; padded.len()];
+    for (frame_index, chunk) in padded.chunks_exact(frame_size).enumerate() {
+        input.copy_from_slice(chunk);
+        state
+            .process_frame(&mut frame_out, &input)
+            .map_err(js_error)?;
+        if frame_index >= warmup {
+            let start = (frame_index - warmup) * frame_size;
+            enhanced[start..start + frame_size].copy_from_slice(&frame_out);
+        }
+    }
+    enhanced.truncate(at_16k_len.min(enhanced.len()));
+
+    let mut result = if (rate - crate::HUSH_SAMPLE_RATE as f64).abs() < f64::EPSILON {
+        enhanced
+    } else {
+        let mut resampler = Resampler::new(crate::HUSH_SAMPLE_RATE as f64, rate, 1);
+        let mut converted = Vec::with_capacity(samples.len() + 64);
+        resampler.process(&enhanced, &mut converted);
+        resampler.flush(&mut converted);
+        converted
+    };
+    result.resize(samples.len(), 0.0);
+    Ok(result)
+}
+
+#[cfg(feature = "hush")]
+fn js_error(error: crate::HushError) -> JsValue {
+    JsValue::from_str(&error.to_string())
+}

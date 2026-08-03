@@ -6,8 +6,8 @@
   "description": "Browser demo for the nnnoiseless speech denoiser, running as WebAssembly.",
   "scripts": {
     "wasm": "npm run wasm:web && npm run wasm:worklet",
-    "wasm:web": "cd .. && RUSTFLAGS=\"-C target-feature=+simd128\" wasm-pack build --target web --out-dir web/src/pkg --no-default-features --features wasm",
-    "wasm:worklet": "cd .. && RUSTFLAGS=\"-C target-feature=+simd128\" wasm-pack build --target no-modules --out-dir web/src/pkg-worklet --no-default-features --features wasm",
+    "wasm:web": "cd .. && RUSTFLAGS=\"-C target-feature=+simd128\" wasm-pack build --target web --out-dir web/src/pkg --no-default-features --features wasm,hush",
+    "wasm:worklet": "cd .. && RUSTFLAGS=\"-C target-feature=+simd128\" wasm-pack build --target no-modules --out-dir web/src/pkg-worklet --no-default-features --features wasm,hush",
     "dev": "vite",
     "build": "npm run wasm && npm run typecheck && vite build && npm test",
     "preview": "vite preview",

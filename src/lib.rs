@@ -29,6 +29,8 @@ mod pitch;
 mod resample;
 mod rnn;
 mod simd;
+#[cfg(feature = "hush")]
+mod hush;
 #[cfg(feature = "wasm")]
 mod wasm;
 
@@ -38,6 +40,8 @@ pub use multi::{ChannelLink, MultiDenoiser};
 pub use params::DenoiseParams;
 pub use resample::Resampler;
 pub use rnn::{Activation, DenseLayer, GruLayer, RnnModel};
+#[cfg(feature = "hush")]
+pub use hush::{HushDenoiser, HushError, HushModel, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
 #[cfg(feature = "dasp")]
 pub use signal::DenoiseSignal;
 pub use simd::Isa;

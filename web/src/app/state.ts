@@ -6,4 +6,5 @@ export const state: AppState = {
   audioCtx: null,
   playing: null,
   mic: null,
+  hushModel: null,
 };

@@ -12,12 +12,25 @@
 
 type WorkletWasm = typeof wasm_bindgen & {
   initSync(module: { module: WebAssembly.Module }): InitOutput;
+  HushDenoiser: {
+    fromModelBytes(modelBytes: Uint8Array, attenuationLimitDb: number): HushBinding;
+  };
+};
+
+type HushBinding = {
+  readonly sampleRate: number;
+  readonly latencySamples: number;
+  readonly lsnrDb: number;
+  push(input: Float32Array): Float32Array;
+  reset(): void;
+  setAttenuationLimitDb(db: number): void;
 };
 
 const wasm = wasm_bindgen as WorkletWasm;
 
 class NnnoiselessProcessor extends AudioWorkletProcessor {
   private denoiser: wasm_bindgen.Denoiser | null = null;
+  private hush: HushBinding | null = null;
   private bypass = false;
   private blockCount = 0;
 
@@ -30,17 +43,30 @@ class NnnoiselessProcessor extends AudioWorkletProcessor {
         switch (msg.type) {
           case 'init': {
             wasm.initSync({ module: msg.module });
-            this.denoiser = wasm.Denoiser.withSettings(
-              msg.attenuationDb ?? 0,
-              msg.vadThreshold ?? 0,
-              0, // lookahead adds latency; keep the live path as tight as possible
-            );
+            if (msg.backend === 'hush') {
+              this.hush = wasm.HushDenoiser.fromModelBytes(
+                new Uint8Array(msg.modelBytes),
+                msg.attenuationDb ?? 0,
+              );
+              if (sampleRate !== this.hush.sampleRate) {
+                throw new Error(
+                  `Hush requires a 16 kHz AudioContext, got ${sampleRate} Hz`,
+                );
+              }
+            } else {
+              this.denoiser = wasm.Denoiser.withSettings(
+                msg.attenuationDb ?? 0,
+                msg.vadThreshold ?? 0,
+                0, // lookahead adds latency; keep the live path as tight as possible
+              );
+            }
+            const active = this.hush ?? this.denoiser;
             this.port.postMessage({
               type: 'ready',
-              isa: this.denoiser.activeIsa,
-              latencySamples: this.denoiser.latencySamples,
+              latencySamples: active?.latencySamples ?? 0,
               // `sampleRate` is a global in the worklet scope.
               sampleRate,
+              backend: msg.backend ?? 'rnnoise',
             });
             break;
           }
@@ -48,13 +74,15 @@ class NnnoiselessProcessor extends AudioWorkletProcessor {
             this.bypass = Boolean(msg.value);
             break;
           case 'attenuation':
-            this.denoiser?.setAttenuationLimitDb(msg.value);
+            if (this.hush) this.hush.setAttenuationLimitDb(msg.value);
+            else this.denoiser?.setAttenuationLimitDb(msg.value);
             break;
           case 'vadThreshold':
             this.denoiser?.setVadThreshold(msg.value);
             break;
           case 'reset':
-            this.denoiser?.reset();
+            if (this.hush) this.hush.reset();
+            else this.denoiser?.reset();
             break;
           default:
             break;
@@ -79,7 +107,7 @@ class NnnoiselessProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    if (!this.denoiser || this.bypass) {
+    if ((!this.denoiser && !this.hush) || this.bypass) {
       outChannel.set(inChannel);
       return true;
     }
@@ -88,7 +116,7 @@ class NnnoiselessProcessor extends AudioWorkletProcessor {
     // though the algorithm works in 480-sample frames, and returns at most as
     // many samples as it was given. It returns fewer only while filling its
     // delay line, which is why the tail is zeroed.
-    const denoised = this.denoiser.push(inChannel);
+    const denoised = this.hush ? this.hush.push(inChannel) : this.denoiser!.push(inChannel);
     if (denoised.length < outChannel.length) {
       outChannel.fill(0);
     }
@@ -103,7 +131,10 @@ class NnnoiselessProcessor extends AudioWorkletProcessor {
     // is plenty for a meter.
     this.blockCount += 1;
     if ((this.blockCount & 3) === 0) {
-      this.port.postMessage({ type: 'vad', value: this.denoiser.vad });
+      const value = this.hush
+        ? Math.max(0, Math.min(1, (this.hush.lsnrDb + 15) / 50))
+        : this.denoiser!.vad;
+      this.port.postMessage({ type: 'vad', value });
     }
     return true;
   }

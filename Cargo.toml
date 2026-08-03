@@ -25,6 +25,9 @@ low-memory = []
 # JavaScript/WebAssembly bindings. Build with
 # `wasm-pack build --target web --no-default-features --features wasm`.
 wasm = ["dep:wasm-bindgen"]
+# Hush is a DeepFilterNet-SE backend. It is deliberately opt-in because it
+# brings the larger Tract runtime and loads its model bundle separately.
+hush = ["dep:df", "dep:ndarray"]
 
 [lib]
 path = "src/lib.rs"
@@ -45,6 +48,11 @@ required-features = ["mic-example"]
 name = "denoise"
 harness = false
 
+[[bench]]
+name = "hush"
+harness = false
+required-features = ["hush"]
+
 [dependencies]
 realfft = "3.5.0"
 anyhow = { version = "1.0.55", optional = true }
@@ -53,6 +61,16 @@ cpal = { version = "0.18.1", optional = true }
 dasp = { version = "0.11.0", features = ["signal"], optional = true }
 hound = { version = "3.4.0", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+# Hush's released runtime is built on DeepFilterNet 0.5.3 and Tract. The model
+# bundle is supplied at runtime (or from JavaScript in the WASM API), so it is
+# not embedded in the base crate.
+df = { git = "https://github.com/Rikorose/DeepFilterNet.git", tag = "v0.5.3", package = "deep_filter", default-features = false, features = ["tract", "transforms"], optional = true }
+ndarray = { version = "0.15", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Tract pulls getrandom 0.2 through its ONNX operator helpers. The Hush WASM
+# build does not need OS entropy, but getrandom still needs its browser shim.
+getrandom = { version = "0.2", features = ["js"] }
 
 [profile.release]
 lto = "thin"

@@ -25,6 +25,31 @@ async function main(): Promise<void> {
   ui.version.textContent = version();
   ui.isa.textContent = activeIsa();
 
+  ui.backend.addEventListener('change', () => {
+    renderSettings();
+    processClip();
+    if (state.mic) {
+      stopMic();
+      ui.micError.textContent = 'Microphone stopped; restart it to change backend.';
+      ui.micError.hidden = false;
+    }
+  });
+
+  ui.hushModel.addEventListener('change', async () => {
+    const file = ui.hushModel.files?.[0];
+    if (!file) return;
+    ui.hushModelInfo.textContent = 'loading…';
+    try {
+      state.hushModel = new Uint8Array(await file.arrayBuffer());
+      ui.hushModelInfo.textContent = `Hush ${(state.hushModel.byteLength / 1_000_000).toFixed(1)} MB`;
+      processClip();
+    } catch (err: unknown) {
+      state.hushModel = null;
+      ui.hushModelInfo.textContent = 'load failed';
+      ui.clipInfo.textContent = `could not load Hush model: ${errorMessage(err)}`;
+    }
+  });
+
   for (const control of [ui.attenuation, ui.vad, ui.lookahead]) {
     control.addEventListener('input', () => {
       renderSettings();
