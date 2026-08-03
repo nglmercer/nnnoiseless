@@ -503,6 +503,7 @@ dependencies = [
  "dasp",
  "hound",
  "realfft",
+ "wasm-bindgen",
 ]
 
 [[package]]

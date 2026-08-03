@@ -409,9 +409,12 @@ impl RnnModel {
                 let n = r.dim()?;
                 (i, n, Activation::from_code(r.byte()? as i32)?)
             };
-            let input_weights = r.array(3usize.checked_mul(nb_neurons)?.checked_mul(nb_inputs)?, moo)?;
-            let recurrent_weights =
-                r.array(3usize.checked_mul(nb_neurons)?.checked_mul(nb_neurons)?, moo)?;
+            let input_weights =
+                r.array(3usize.checked_mul(nb_neurons)?.checked_mul(nb_inputs)?, moo)?;
+            let recurrent_weights = r.array(
+                3usize.checked_mul(nb_neurons)?.checked_mul(nb_neurons)?,
+                moo,
+            )?;
             let bias = r.array(3 * nb_neurons, moo)?;
             Some(GruLayer {
                 nb_inputs,
@@ -495,8 +498,7 @@ impl DenseLayer {
         debug_assert_eq!(output.len(), self.nb_neurons);
         debug_assert_eq!(input.len(), self.nb_inputs);
         self.bias.load(output, 0);
-        self.input_weights
-            .matvec(self.nb_neurons, 0, output, input);
+        self.input_weights.matvec(self.nb_neurons, 0, output, input);
 
         let scale = Weights::POST_SCALE;
         let act = self.activation;
@@ -643,9 +645,7 @@ impl<'model> RnnState<'model> {
             &self.denoise_buf,
             &mut self.scratch,
         );
-        model
-            .denoise_output
-            .compute(gains, &self.denoise_gru_state);
+        model.denoise_output.compute(gains, &self.denoise_gru_state);
     }
 }
 
@@ -674,12 +674,18 @@ mod tests {
         assert_eq!(&encoded[..4], MAGIC_V2);
         let decoded = RnnModel::from_bytes(&encoded).expect("v2 model should parse");
 
-        assert_eq!(decoded.denoise_gru.nb_neurons, original.denoise_gru.nb_neurons);
+        assert_eq!(
+            decoded.denoise_gru.nb_neurons,
+            original.denoise_gru.nb_neurons
+        );
         assert_eq!(
             decoded.denoise_gru.input_weights.to_i8(),
             original.denoise_gru.input_weights.to_i8()
         );
-        assert_eq!(decoded.vad_output.bias.to_i8(), original.vad_output.bias.to_i8());
+        assert_eq!(
+            decoded.vad_output.bias.to_i8(),
+            original.vad_output.bias.to_i8()
+        );
         assert_eq!(
             decoded.input_dense.input_weights.len(),
             original.input_dense.input_weights.len()

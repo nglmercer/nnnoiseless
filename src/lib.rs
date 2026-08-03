@@ -30,7 +30,7 @@ mod resample;
 mod rnn;
 mod simd;
 
-pub use denoise::DenoiseState;
+pub use denoise::{denoise_offline, DenoiseState};
 pub use features::DenoiseFeatures;
 pub use multi::{ChannelLink, MultiDenoiser};
 pub use params::DenoiseParams;

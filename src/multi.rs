@@ -116,7 +116,11 @@ impl<'model> MultiDenoiser<'model> {
     /// exactly [`DenoiseState::FRAME_SIZE`] samples long. Returns the greatest voice-activity
     /// probability across the channels.
     pub fn process_frame(&mut self, output: &mut [&mut [f32]], input: &[&[f32]]) -> f32 {
-        assert_eq!(input.len(), self.states.len(), "wrong number of input channels");
+        assert_eq!(
+            input.len(),
+            self.states.len(),
+            "wrong number of input channels"
+        );
         assert_eq!(
             output.len(),
             self.states.len(),

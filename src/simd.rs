@@ -44,10 +44,12 @@ pub(crate) struct Kernels {
     pub(crate) dot: fn(&[f32], &[f32]) -> f32,
     /// `out[i] = sum_j xs[j] * ys[i + j]`, for every `i` in `0..out.len()`.
     pub(crate) xcorr: fn(&[f32], &[f32], &mut [f32]),
-    /// `out[j] += sum_i w[i * stride + offset + j] * input[i]`.
+    /// `out[j] += sum_i w[i * stride + offset + j] * input[i]`. Unused under `low-memory`,
+    /// which keeps the weights quantized and goes through `matvec_i8` instead.
+    #[cfg_attr(feature = "low-memory", allow(dead_code))]
     pub(crate) matvec: fn(&[f32], usize, usize, &mut [f32], &[f32]),
     /// As `matvec`, but widening `i8` weights on the fly. Only read under `low-memory`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "low-memory"), allow(dead_code))]
     pub(crate) matvec_i8: fn(&[i8], usize, usize, &mut [f32], &[f32]),
     /// Band-aggregated correlation between two spectra.
     pub(crate) band_corr: fn(&mut [f32], &[Complex], &[Complex], &BandTables),
@@ -58,7 +60,8 @@ impl Kernels {
         #[cfg(not(feature = "reference"))]
         {
             #[cfg(target_arch = "x86_64")]
-            if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
             {
                 return Kernels {
                     isa: Isa::Avx2Fma,
@@ -246,6 +249,8 @@ fn band_corr_body(out: &mut [f32], x: &[Complex], p: &[Complex], bands: &BandTab
 ///
 /// The wrappers are only ever installed into `Kernels` after the corresponding runtime
 /// feature check has passed, which is what makes the `unsafe` calls sound.
+// Unused when the `reference` feature pins everything to the scalar path.
+#[allow(unused_macros)]
 macro_rules! instantiate {
     ($module:ident, $($feature:literal),+) => {
         mod $module {
@@ -337,7 +342,10 @@ mod tests {
         (k.xcorr)(&xs, &ys, &mut got);
         xcorr_body(&xs, &ys, &mut want);
         for (g, w) in got.iter().zip(&want) {
-            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "xcorr: {g} vs {w}");
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "xcorr: {g} vs {w}"
+            );
         }
 
         // matvec
@@ -349,7 +357,10 @@ mod tests {
         (k.matvec)(&w, stride, offset, &mut got, &input);
         matvec_body(&w, stride, offset, &mut want, &input);
         for (g, wv) in got.iter().zip(&want) {
-            assert!((g - wv).abs() <= 1e-3 * wv.abs().max(1.0), "matvec: {g} vs {wv}");
+            assert!(
+                (g - wv).abs() <= 1e-3 * wv.abs().max(1.0),
+                "matvec: {g} vs {wv}"
+            );
         }
 
         // band correlation
@@ -362,7 +373,10 @@ mod tests {
         (k.band_corr)(&mut got, &spec, &spec, &bands);
         band_corr_body(&mut want, &spec, &spec, &bands);
         for (g, w) in got.iter().zip(&want) {
-            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "band_corr: {g} vs {w}");
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "band_corr: {g} vs {w}"
+            );
         }
     }
 

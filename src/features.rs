@@ -139,7 +139,8 @@ impl DenoiseFeatures {
     /// Makes room for one more frame and returns the range it should be written to.
     fn advance(&mut self) -> std::ops::Range<usize> {
         if self.end + FRAME_SIZE > HISTORY_CAP {
-            self.history.copy_within((self.end - PITCH_BUF_SIZE)..self.end, 0);
+            self.history
+                .copy_within((self.end - PITCH_BUF_SIZE)..self.end, 0);
             self.end = PITCH_BUF_SIZE;
         }
         let range = self.end..(self.end + FRAME_SIZE);
@@ -176,7 +177,7 @@ impl DenoiseFeatures {
     fn find_pitch(&mut self, interval: usize) -> usize {
         // The pitch period moves slowly compared to the 10ms frame rate, so the search can be
         // run less often. This is off by default because it does change the output.
-        if interval > 1 && self.frame_count % interval as u64 != 0 {
+        if interval > 1 && !self.frame_count.is_multiple_of(interval as u64) {
             let (period, _) = self.pitch_finder.last();
             if period != 0 {
                 return period;

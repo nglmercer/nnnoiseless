@@ -184,7 +184,7 @@ impl Resampler {
         }
         self.finished = true;
         self.history
-            .extend(std::iter::repeat(0.0).take(self.taps * self.channels));
+            .extend(std::iter::repeat_n(0.0, self.taps * self.channels));
         self.emit(output, true);
     }
 
@@ -296,7 +296,10 @@ mod tests {
         );
 
         // Count zero crossings to confirm the frequency was preserved.
-        let crossings = body.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        let crossings = body
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
         let expected = 440.0 * body.len() as f64 / to;
         assert!(
             (crossings as f64 - expected).abs() < 0.02 * expected,
@@ -342,7 +345,7 @@ mod tests {
         let from = 24000.0;
         let to = 48000.0;
         let left = tone(12000, 300.0, from);
-        let right: Vec<f32> = std::iter::repeat(0.0).take(12000).collect();
+        let right: Vec<f32> = std::iter::repeat_n(0.0, 12000).collect();
         let interleaved: Vec<f32> = left
             .iter()
             .zip(&right)
@@ -353,7 +356,11 @@ mod tests {
         assert_eq!(out.len() % 2, 0);
         let right_out: Vec<f32> = out.chunks_exact(2).map(|c| c[1]).collect();
         let left_out: Vec<f32> = out.chunks_exact(2).map(|c| c[0]).collect();
-        assert!(rms(&right_out) < 1e-6, "silence leaked: {}", rms(&right_out));
+        assert!(
+            rms(&right_out) < 1e-6,
+            "silence leaked: {}",
+            rms(&right_out)
+        );
         assert!(rms(&left_out) > 0.5);
     }
 

@@ -4,59 +4,123 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Error};
 use clap::{arg, crate_version, Command};
-use dasp_interpolate::{sinc::Sinc, Interpolator};
-use dasp_ring_buffer::Fixed;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 
-use nnnoiseless::{DenoiseState, RnnModel};
+use nnnoiseless::{ChannelLink, DenoiseParams, DenoiseState, MultiDenoiser, Resampler, RnnModel};
 
 const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
+const DENOISER_RATE: f64 = 48_000.0;
 
-trait ReadSample {
-    fn next_sample(&mut self) -> Result<Option<&[f32]>, Error>;
-    fn channels(&self) -> usize;
+/// Reads interleaved samples from a source, a whole frame at a time.
+///
+/// The previous version of this handed out one sample at a time through a `Box<dyn Trait>`,
+/// which meant a virtual call per sample. Batching at frame granularity removes ~480 indirect
+/// calls per frame.
+trait FrameSource {
+    /// Fills `out` with up to `out.len()` interleaved samples, returning how many were written.
+    fn read_frame(&mut self, out: &mut [f32]) -> Result<usize, Error>;
+}
 
-    fn resampled(self, ratio: f64) -> Resample<Self>
-    where
-        Self: Sized,
-    {
-        Resample {
-            sinc: (0..self.channels())
-                .map(|_| Sinc::new(Fixed::from([0.0; 16])))
-                .collect(),
-            buf: vec![0.0; self.channels()],
-            ratio,
-            pos: 0.0,
-            read: self,
+/// Pulls samples from an iterator and resamples them to 48kHz if necessary.
+struct SampleReader<I> {
+    samples: I,
+    channels: usize,
+    resampler: Option<Resampler>,
+    /// Resampled output waiting to be handed out.
+    ready: Vec<f32>,
+    ready_pos: usize,
+    /// Staging area for input handed to the resampler.
+    staging: Vec<f32>,
+    exhausted: bool,
+}
+
+/// How many input frames to hand the resampler at a time.
+const RESAMPLE_CHUNK_FRAMES: usize = 2048;
+
+impl<I: Iterator<Item = Result<f32, Error>>> SampleReader<I> {
+    fn new(samples: I, channels: usize, sample_rate: f64) -> SampleReader<I> {
+        let resampler = if (sample_rate - DENOISER_RATE).abs() > f64::EPSILON {
+            Some(Resampler::to_denoiser_rate(sample_rate, channels))
+        } else {
+            None
+        };
+        SampleReader {
+            samples,
+            channels,
+            resampler,
+            ready: Vec::new(),
+            ready_pos: 0,
+            staging: Vec::with_capacity(RESAMPLE_CHUNK_FRAMES * channels),
+            exhausted: false,
         }
+    }
+
+    /// Tops up `ready`, returning false once the source is finished and drained.
+    fn refill(&mut self) -> Result<bool, Error> {
+        if self.ready_pos < self.ready.len() {
+            return Ok(true);
+        }
+        self.ready.clear();
+        self.ready_pos = 0;
+
+        while self.ready.is_empty() {
+            if self.exhausted {
+                return Ok(false);
+            }
+
+            self.staging.clear();
+            for _ in 0..(RESAMPLE_CHUNK_FRAMES * self.channels) {
+                match self.samples.next() {
+                    Some(Ok(s)) => self.staging.push(s),
+                    Some(Err(e)) => return Err(e),
+                    None => {
+                        self.exhausted = true;
+                        break;
+                    }
+                }
+            }
+            if !self.staging.len().is_multiple_of(self.channels) {
+                return Err(anyhow!(
+                    "Unexpected end of input (expected a multiple of {} samples)",
+                    self.channels
+                ));
+            }
+
+            match self.resampler.as_mut() {
+                None => std::mem::swap(&mut self.ready, &mut self.staging),
+                Some(r) => {
+                    r.process(&self.staging, &mut self.ready);
+                    if self.exhausted {
+                        r.flush(&mut self.ready);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<I: Iterator<Item = Result<f32, Error>>> FrameSource for SampleReader<I> {
+    fn read_frame(&mut self, out: &mut [f32]) -> Result<usize, Error> {
+        let mut written = 0;
+        while written < out.len() {
+            if !self.refill()? {
+                break;
+            }
+            let available = self.ready.len() - self.ready_pos;
+            let take = available.min(out.len() - written);
+            out[written..(written + take)]
+                .copy_from_slice(&self.ready[self.ready_pos..(self.ready_pos + take)]);
+            self.ready_pos += take;
+            written += take;
+        }
+        Ok(written)
     }
 }
 
 // TODO: support either endianness
 struct RawSampleIter<R: Read> {
     reader: R,
-}
-
-struct Resample<RS: ReadSample> {
-    sinc: Vec<Sinc<[f32; 16]>>,
-    buf: Vec<f32>,
-    ratio: f64,
-    pos: f64,
-    read: RS,
-}
-
-struct IterReadSample<I> {
-    samples: I,
-    buf: Vec<f32>,
-}
-
-impl<I: Iterator<Item = Result<f32, Error>>> IterReadSample<I> {
-    fn new(iter: I, channels: usize) -> IterReadSample<I> {
-        IterReadSample {
-            samples: iter,
-            buf: vec![0.0; channels],
-        }
-    }
 }
 
 impl<R: Read> Iterator for RawSampleIter<R> {
@@ -85,59 +149,6 @@ impl<R: Read> Iterator for RawSampleIter<R> {
     }
 }
 
-impl<I: Iterator<Item = Result<f32, Error>>> ReadSample for IterReadSample<I> {
-    fn next_sample(&mut self) -> Result<Option<&[f32]>, Error> {
-        for (i, sample) in self.buf.iter_mut().enumerate() {
-            match self.samples.next() {
-                None => {
-                    if i == 0 {
-                        return Ok(None);
-                    } else {
-                        return Err(anyhow!(
-                            "Unexpected end of input (expected a multiple of {} samples)",
-                            self.buf.len()
-                        ));
-                    }
-                }
-                Some(Err(e)) => return Err(e),
-                Some(Ok(x)) => *sample = x,
-            }
-        }
-        Ok(Some(&self.buf[..]))
-    }
-
-    fn channels(&self) -> usize {
-        self.buf.len()
-    }
-}
-
-impl<RS: ReadSample> ReadSample for Resample<RS> {
-    fn next_sample(&mut self) -> Result<Option<&[f32]>, Error> {
-        self.pos += self.ratio;
-        while self.pos >= 1.0 {
-            self.pos -= 1.0;
-
-            if let Some(buf) = self.read.next_sample()? {
-                for (s, &x) in self.sinc.iter_mut().zip(buf) {
-                    s.next_source_frame(x);
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-
-        for (s, x) in self.sinc.iter().zip(&mut self.buf) {
-            *x = s.interpolate(self.pos);
-        }
-
-        Ok(Some(&self.buf[..]))
-    }
-
-    fn channels(&self) -> usize {
-        self.read.channels()
-    }
-}
-
 trait FrameWriter {
     fn write_frame(&mut self, buf: &[f32]) -> Result<(), Error>;
     fn finalize(&mut self) -> Result<(), Error>;
@@ -154,7 +165,7 @@ struct WavFrameWriter<W: Write + Seek> {
 
 impl<W: Write> FrameWriter for RawFrameWriter<W> {
     fn write_frame(&mut self, buf: &[f32]) -> Result<(), Error> {
-        assert_eq!(buf.len() * 2, self.buf.len());
+        self.buf.resize(buf.len() * 2, 0);
         for (dst, src) in self.buf.chunks_mut(2).zip(buf) {
             let bytes =
                 (src.max(i16::MIN as f32).min(i16::MAX as f32).round() as i16).to_le_bytes();
@@ -184,17 +195,15 @@ impl<W: Write + Seek> FrameWriter for WavFrameWriter<W> {
     }
 }
 
-fn raw_samples<R: Read + 'static>(r: R, channels: usize, sample_rate: f64) -> Box<dyn ReadSample> {
-    let raw = IterReadSample::new(RawSampleIter { reader: r }, channels);
-
-    if sample_rate != 48_000.0 {
-        Box::new(raw.resampled(sample_rate / 48_000.0))
-    } else {
-        Box::new(raw)
-    }
+fn raw_samples<R: Read + 'static>(r: R, channels: usize, sample_rate: f64) -> Box<dyn FrameSource> {
+    Box::new(SampleReader::new(
+        RawSampleIter { reader: r },
+        channels,
+        sample_rate,
+    ))
 }
 
-fn wav_samples<R: Read + 'static>(wav: WavReader<R>) -> Box<dyn ReadSample> {
+fn wav_samples<R: Read + 'static>(wav: WavReader<R>) -> Box<dyn FrameSource> {
     let sample_rate = wav.spec().sample_rate as f64;
     let channels = wav.spec().channels as usize;
     match wav.spec().sample_format {
@@ -212,48 +221,55 @@ fn wav_samples<R: Read + 'static>(wav: WavReader<R>) -> Box<dyn ReadSample> {
                 })
                 .map_err(|e| e.into())
             });
-
-            let read_sample = IterReadSample::new(iter, channels);
-            if sample_rate != 48_000.0 {
-                Box::new(read_sample.resampled(sample_rate / 48_000.0))
-            } else {
-                Box::new(read_sample)
-            }
+            Box::new(SampleReader::new(iter, channels, sample_rate))
         }
         SampleFormat::Float => {
             let iter = wav
                 .into_samples::<f32>()
                 .map(|s| s.map(|s| s * 32767.0).map_err(|e| e.into()));
-
-            let read_sample = IterReadSample::new(iter, channels);
-            if sample_rate != 48_000.0 {
-                Box::new(read_sample.resampled(sample_rate / 48_000.0))
-            } else {
-                Box::new(read_sample)
-            }
+            Box::new(SampleReader::new(iter, channels, sample_rate))
         }
     }
 }
 
+fn parse_positive<T: std::str::FromStr + PartialOrd + Default>(s: &str) -> Result<(), String> {
+    match s.parse::<T>() {
+        Ok(v) if v > T::default() => Ok(()),
+        Ok(_) => Err("must be greater than zero".to_string()),
+        Err(_) => Err("not a number".to_string()),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let matches =
-        Command::new("nnnoiseless")
-            .version(crate_version!())
-            .about("Remove noise from audio files")
-            .arg(arg!(<INPUT> "input audio file"))
-            .arg(arg!(<OUTPUT> "output audio file"))
-            .arg(arg!(--"wav-in" "the input is a wav file (default is to detect wav files by their filename"))
-            .arg(arg!(--"wav-out" "the output is a wav file (default is to detect wav files by their filename)"))
-            .arg(arg!(--"sample-rate" <RATE> "for raw input, the sample rate of the input (defaults to 48kHz)").required(false)
-                    .validator(|s| s.parse::<f64>()),
-            )
-            .arg(
-                arg!(--channels <CHANNELS> "for raw input, the number of channels (defaults to 1)")
-                    .required(false)
-                    .validator(|s| s.parse::<u16>()),
-            )
-            .arg(arg!(--model <PATH> "path to a custom model file").required(false))
-            .get_matches();
+    let matches = Command::new("nnnoiseless")
+        .version(crate_version!())
+        .about("Remove noise from audio files")
+        .arg(arg!(<INPUT> "input audio file"))
+        .arg(arg!(<OUTPUT> "output audio file"))
+        .arg(arg!(--"wav-in" "the input is a wav file (default is to detect wav files by their filename"))
+        .arg(arg!(--"wav-out" "the output is a wav file (default is to detect wav files by their filename)"))
+        .arg(arg!(--"sample-rate" <RATE> "for raw input, the sample rate of the input (defaults to 48kHz)").required(false)
+                .validator(parse_positive::<f64>))
+        .arg(arg!(--channels <CHANNELS> "for raw input, the number of channels (defaults to 1)")
+                .required(false)
+                .validator(parse_positive::<u16>))
+        .arg(arg!(--model <PATH> "path to a custom model file").required(false))
+        .arg(arg!(--"max-attenuation" <DB> "limit suppression to this many dB, leaving a noise floor (default: unlimited)")
+                .required(false)
+                .validator(|s| s.parse::<f32>().map(|_| ())))
+        .arg(arg!(--"vad-threshold" <PROB> "attenuate frames whose speech probability is below this (0..1, default 0)")
+                .required(false)
+                .validator(|s| s.parse::<f32>().map(|_| ())))
+        .arg(arg!(--lookahead <FRAMES> "look this many 10ms frames ahead to protect speech onsets (default 0)")
+                .required(false)
+                .validator(|s| s.parse::<usize>().map(|_| ())))
+        .arg(arg!(--"pitch-interval" <N> "run the pitch search every N frames; faster, slightly lower quality (default 1)")
+                .required(false)
+                .validator(parse_positive::<usize>))
+        .arg(arg!(--"link-channels" <MODE> "how to combine gains across channels: independent, max, mean (default: max)")
+                .required(false)
+                .possible_values(["independent", "max", "mean"]))
+        .get_matches();
 
     let in_name = matches.value_of("INPUT").unwrap();
     let out_name = matches.value_of("OUTPUT").unwrap();
@@ -307,7 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Box::new(RawFrameWriter {
             writer: out_file,
-            buf: vec![0; FRAME_SIZE * 2],
+            buf: Vec::new(),
         })
     };
 
@@ -318,31 +334,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         RnnModel::default()
     };
 
+    let mut params = DenoiseParams::default();
+    if let Some(db) = matches.value_of("max-attenuation") {
+        params = params.max_attenuation_db(db.parse()?);
+    }
+    if let Some(p) = matches.value_of("vad-threshold") {
+        params = params.vad_threshold(p.parse()?);
+    }
+    if let Some(f) = matches.value_of("lookahead") {
+        params = params.lookahead(f.parse()?);
+    }
+    if let Some(n) = matches.value_of("pitch-interval") {
+        params = params.pitch_interval(n.parse()?);
+    }
+    let link = match matches.value_of("link-channels").unwrap_or("max") {
+        "independent" => ChannelLink::Independent,
+        "mean" => ChannelLink::Mean,
+        _ => ChannelLink::Max,
+    };
+
     let channels = channels as usize;
+    let mut denoiser = MultiDenoiser::with_model(channels, link, &model, params);
+    let latency = denoiser.latency_frames();
+
+    let mut interleaved = vec![0.0; FRAME_SIZE * channels];
     let mut in_bufs = vec![vec![0.0; FRAME_SIZE]; channels];
     let mut out_bufs = vec![vec![0.0; FRAME_SIZE]; channels];
     let mut out_buf = vec![0.0; FRAME_SIZE * channels];
-    let mut states = vec![DenoiseState::with_model(&model); channels];
-    let mut first = true;
-    'outer: loop {
-        let mut frame_slots = in_bufs
-            .iter_mut()
-            .map(|channel| channel.iter_mut())
-            .collect::<Vec<_>>();
-        for _ in 0..FRAME_SIZE {
-            if let Some(buf) = samples.next_sample()? {
-                for (slot, &sample) in frame_slots.iter_mut().zip(buf) {
-                    *slot.next().expect("frame slot length matches FRAME_SIZE") = sample;
-                }
-            } else {
-                break 'outer;
+
+    // Frames still inside the denoiser's delay line when the input runs out.
+    let mut pending = latency;
+    let mut emitted = 0usize;
+
+    loop {
+        let read = samples.read_frame(&mut interleaved)?;
+        if read == 0 {
+            if pending == 0 {
+                break;
+            }
+            // Push silence through so the tail of the signal comes back out.
+            pending -= 1;
+            interleaved.fill(0.0);
+        } else if read < interleaved.len() {
+            interleaved[read..].fill(0.0);
+        }
+
+        for (ch, buf) in in_bufs.iter_mut().enumerate() {
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = interleaved[i * channels + ch];
             }
         }
 
-        for j in 0..channels {
-            states[j].process_frame(&mut out_bufs[j], &in_bufs[j]);
+        {
+            let ins: Vec<&[f32]> = in_bufs.iter().map(|b| &b[..]).collect();
+            let mut outs: Vec<&mut [f32]> = out_bufs.iter_mut().map(|b| &mut b[..]).collect();
+            denoiser.process_frame(&mut outs, &ins);
         }
-        if !first {
+
+        // Drop the leading frames that are still the denoiser warming up, so the output lines
+        // up with the input.
+        emitted += 1;
+        if emitted > latency {
             for i in 0..FRAME_SIZE {
                 for j in 0..channels {
                     out_buf[i * channels + j] = out_bufs[j][i];
@@ -350,7 +402,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             frame_writer.write_frame(&out_buf[..])?;
         }
-        first = false;
     }
     frame_writer.finalize()?;
 

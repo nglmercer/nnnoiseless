@@ -43,8 +43,6 @@ pub struct DenoiseState<'model> {
     gains: [f32; NB_BANDS],
     rnn: crate::rnn::RnnState<'model>,
     feat: crate::features::DenoiseFeatures,
-    /// Set once the first frame has been fed through twice, when priming is enabled.
-    primed: bool,
     /// Voice-activity probability for the frame `analyze` most recently looked at.
     vad_scratch: f32,
 
@@ -108,10 +106,7 @@ impl<'model> DenoiseState<'model> {
         model: &'model RnnModel,
         params: DenoiseParams,
     ) -> Box<DenoiseState<'model>> {
-        Box::new(DenoiseState::from_model_owned(
-            Cow::Borrowed(model),
-            params,
-        ))
+        Box::new(DenoiseState::from_model_owned(Cow::Borrowed(model), params))
     }
 
     pub(crate) fn from_model_owned(
@@ -125,7 +120,6 @@ impl<'model> DenoiseState<'model> {
             gains: [0.0; NB_BANDS],
             rnn: crate::rnn::RnnState::new(model),
             feat: crate::features::DenoiseFeatures::new(),
-            primed: false,
             vad_scratch: 0.0,
             spec_ring: vec![vec![Complex::default(); FREQ_SIZE]; look],
             gain_ring: vec![[0.0; NB_BANDS]; if look > 0 { look + 1 } else { 0 }],
@@ -142,13 +136,15 @@ impl<'model> DenoiseState<'model> {
 
     /// How many frames of output lag the input.
     ///
-    /// This is one frame for the algorithm's own overlap-add delay (which is why the first
-    /// output frame should normally be discarded), plus any frames requested by
-    /// [`DenoiseParams::lookahead`]. It is zero if [`DenoiseParams::prime`] was enabled and no
-    /// lookahead was requested.
+    /// This is one frame for the algorithm's own overlap-add delay, plus any frames requested
+    /// by [`DenoiseParams::lookahead`].
+    ///
+    /// The one-frame floor is intrinsic and cannot be removed: reconstructing input frame `k`
+    /// needs the analysis window spanning frames `k` and `k+1`, so no causal implementation
+    /// can emit frame `k` before it has been given frame `k+1`. [`denoise_offline`] takes care
+    /// of the bookkeeping if you have the whole signal up front.
     pub fn latency_frames(&self) -> usize {
-        let base = if self.params.prime_enabled() { 0 } else { 1 };
-        base + self.params.lookahead_value()
+        1 + self.params.lookahead_value()
     }
 
     /// Forgets all history, as though this state had just been created.
@@ -157,7 +153,6 @@ impl<'model> DenoiseState<'model> {
         self.gains = [0.0; NB_BANDS];
         self.rnn.reset();
         self.feat.reset();
-        self.primed = false;
         self.vad_scratch = 0.0;
         for s in self.spec_ring.iter_mut() {
             for v in s.iter_mut() {
@@ -187,21 +182,12 @@ impl<'model> DenoiseState<'model> {
     /// The current output of `process_frame` depends on the current input, but also on the
     /// preceding inputs. Because of this, you might prefer to discard the very first output; it
     /// will contain some fade-in artifacts. See [`DenoiseState::latency_frames`], and
-    /// [`DenoiseParams::prime`] if you would rather not have to.
+    /// [`denoise_offline`] if you have the whole signal and would rather not think about it.
     ///
     /// Returns the probability that the emitted frame contained speech.
     pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> f32 {
         assert_eq!(output.len(), FRAME_SIZE);
         assert_eq!(input.len(), FRAME_SIZE);
-
-        if self.params.prime_enabled() && !self.primed {
-            self.primed = true;
-            // Feed the first frame through once to fill the history, throwing the (silent)
-            // output away, so that the caller's frame 0 lines up with our frame 0.
-            let mut discard = [0.0; FRAME_SIZE];
-            let silence = self.analyze(input);
-            self.synthesize(&mut discard, silence);
-        }
 
         let silence = self.analyze(input);
         self.synthesize(output, silence)
@@ -301,7 +287,8 @@ impl<'model> DenoiseState<'model> {
         }
 
         // Rotate the current spectrum into the delay line and take out the oldest one.
-        self.feat.swap_spectrum(&mut self.spec_ring[self.ring_pos % look]);
+        self.feat
+            .swap_spectrum(&mut self.spec_ring[self.ring_pos % look]);
         let emitted_silence =
             std::mem::replace(&mut self.silence_ring[self.ring_pos % look], silence);
 
@@ -329,6 +316,59 @@ impl<'model> DenoiseState<'model> {
         self.ring_pos = self.ring_pos.wrapping_add(1);
         emitted_vad
     }
+}
+
+/// Denoises a complete signal, returning output that lines up with the input sample for
+/// sample.
+///
+/// [`DenoiseState::process_frame`] is a streaming interface, so its output lags its input and
+/// the caller is expected to account for that. When the whole signal is already in memory
+/// there is no reason to make anyone think about it: this runs the stream out past the end,
+/// drops the leading latency, and hands back a buffer the same length as the input. Inputs
+/// that are not a whole number of frames are zero-padded internally.
+///
+/// # Example
+///
+/// ```rust
+/// use nnnoiseless::{denoise_offline, DenoiseParams};
+///
+/// let noisy: Vec<f32> = (0..12_345).map(|i| (i as f32 * 0.3).sin() * 3000.0).collect();
+/// // Two frames of lookahead is a good default when latency does not matter.
+/// let clean = denoise_offline(DenoiseParams::default().lookahead(2), &noisy);
+/// assert_eq!(clean.len(), noisy.len());
+/// ```
+pub fn denoise_offline(params: DenoiseParams, input: &[f32]) -> Vec<f32> {
+    let mut state = DenoiseState::with_params(params);
+    let latency = state.latency_frames();
+
+    let mut frame = [0.0; FRAME_SIZE];
+    let mut out = Vec::with_capacity(input.len() + (latency + 1) * FRAME_SIZE);
+
+    let mut chunks = input.chunks_exact(FRAME_SIZE);
+    for chunk in chunks.by_ref() {
+        state.process_frame(&mut frame, chunk);
+        out.extend_from_slice(&frame);
+    }
+
+    // Zero-pad a ragged final frame rather than dropping it.
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut padded = [0.0; FRAME_SIZE];
+        padded[..tail.len()].copy_from_slice(tail);
+        state.process_frame(&mut frame, &padded);
+        out.extend_from_slice(&frame);
+    }
+
+    // Push the delay line out with silence so the real tail emerges.
+    let silence = [0.0; FRAME_SIZE];
+    for _ in 0..latency {
+        state.process_frame(&mut frame, &silence);
+        out.extend_from_slice(&frame);
+    }
+
+    out.drain(..(latency * FRAME_SIZE).min(out.len()));
+    out.resize(input.len(), 0.0);
+    out
 }
 
 #[cfg(test)]
@@ -440,31 +480,37 @@ mod tests {
         );
     }
 
-    /// Priming should remove the leading silent frame.
+    /// The offline helper must hand back output that lines up with the input, whatever
+    /// latency the configuration introduces.
     #[test]
-    fn priming_aligns_output_with_input() {
-        let input = speech_like(FRAME_SIZE * 6);
-        let plain = run(DenoiseParams::default(), &input);
-        let primed = run(DenoiseParams::default().prime(true), &input);
+    fn offline_helper_aligns_output_with_input() {
+        let input = speech_like(FRAME_SIZE * 20 + 137);
 
-        // The unprimed first frame is not digital silence: applying gains in the frequency
-        // domain smears a little energy backwards into it. It is a fade-in, roughly two
-        // orders of magnitude below the real signal.
-        let plain_first = rms(&plain[..FRAME_SIZE]);
-        let primed_first = rms(&primed[..FRAME_SIZE]);
-        let steady = rms(&plain[FRAME_SIZE * 2..FRAME_SIZE * 4]);
-        assert!(
-            plain_first < 0.05 * steady,
-            "unprimed first frame should be a fade-in: {plain_first} vs {steady}"
-        );
-        assert!(
-            primed_first > 10.0 * plain_first,
-            "primed first frame should carry real audio: {primed_first} vs {plain_first}"
-        );
+        for params in [
+            DenoiseParams::default(),
+            DenoiseParams::default().lookahead(3),
+        ] {
+            let out = denoise_offline(params, &input);
+            assert_eq!(out.len(), input.len(), "length should be preserved");
 
-        let mut st = DenoiseState::with_params(DenoiseParams::default().prime(true));
-        assert_eq!(st.latency_frames(), 0);
-        st.reset();
+            // Correlate against the input to confirm there is no residual frame offset. The
+            // right alignment has to beat every neighbouring shift.
+            let corr = |shift: usize| -> f32 {
+                let n = input.len() - FRAME_SIZE * 6;
+                input[FRAME_SIZE * 2..(FRAME_SIZE * 2 + n)]
+                    .iter()
+                    .zip(&out[(FRAME_SIZE * 2 + shift)..])
+                    .map(|(a, b)| a * b)
+                    .sum()
+            };
+            let aligned = corr(0);
+            for shift in [FRAME_SIZE, FRAME_SIZE * 2] {
+                assert!(
+                    aligned > corr(shift),
+                    "{params:?}: shifted by {shift} correlated better than aligned"
+                );
+            }
+        }
     }
 
     /// Lookahead delays the output by the requested number of frames and otherwise keeps the

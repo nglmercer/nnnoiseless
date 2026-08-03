@@ -11,7 +11,7 @@ use cpal::{
     FromSample, Sample, SampleFormat, SizedSample, I24, U24,
 };
 use hound::{SampleFormat as WavSampleFormat, WavReader, WavSpec, WavWriter};
-use nnnoiseless::{DenoiseState, FRAME_SIZE};
+use nnnoiseless::{denoise_offline, DenoiseParams, Resampler};
 use std::{
     env,
     error::Error,
@@ -269,8 +269,7 @@ fn denoise_wav(input_path: &Path, output_path: &Path) -> Result<usize, Box<dyn E
 
     let samples = reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?;
     let mono = downmix_to_mono(&samples, spec.channels as usize);
-    let resampled = resample_linear(&mono, spec.sample_rate, TARGET_SAMPLE_RATE);
-    let frame_count = resampled.len().div_ceil(FRAME_SIZE);
+    let resampled = resample_to_target(&mono, spec.sample_rate);
 
     let output_spec = WavSpec {
         channels: 1,
@@ -279,30 +278,19 @@ fn denoise_wav(input_path: &Path, output_path: &Path) -> Result<usize, Box<dyn E
         sample_format: WavSampleFormat::Int,
     };
     let mut writer = WavWriter::create(output_path, output_spec)?;
-    let mut state = DenoiseState::new();
-    let mut input_frame = [0.0; FRAME_SIZE];
-    let mut output_frame = [0.0; FRAME_SIZE];
+
+    // The denoiser works on the scale of 16-bit PCM, not on normalized floats.
+    let scaled: Vec<f32> = resampled.iter().map(|s| s * 32_768.0).collect();
+
+    // `denoise_offline` deals with the algorithm's frame of latency and hands back a buffer
+    // the same length as its input, so nothing has to be discarded here.
+    let denoised = denoise_offline(DenoiseParams::default(), &scaled);
+
     let mut written_samples = 0;
-
-    for frame_index in 0..frame_count {
-        input_frame.fill(0.0);
-        let start = frame_index * FRAME_SIZE;
-        let end = (start + FRAME_SIZE).min(resampled.len());
-        let frame_len = end.saturating_sub(start);
-        input_frame[..frame_len].copy_from_slice(&resampled[start..end]);
-        input_frame
-            .iter_mut()
-            .for_each(|sample| *sample *= 32_768.0);
-
-        state.process_frame(&mut output_frame, &input_frame);
-        if frame_index == 0 {
-            continue;
-        }
-        for &sample in &output_frame {
-            let sample = sample.clamp(i16::MIN as f32, i16::MAX as f32).round() as i16;
-            writer.write_sample(sample)?;
-            written_samples += 1;
-        }
+    for &sample in &denoised {
+        let sample = sample.clamp(i16::MIN as f32, i16::MAX as f32).round() as i16;
+        writer.write_sample(sample)?;
+        written_samples += 1;
     }
     writer.finalize()?;
     Ok(written_samples)
@@ -315,24 +303,23 @@ fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == target_rate {
+/// Converts the recording to the 48kHz the denoiser needs.
+///
+/// This used to be a linear interpolator, which aliases badly when the capture device runs
+/// above 48kHz. The library's Kaiser-windowed sinc resampler moves its cutoff with the
+/// conversion ratio, so high-frequency content is filtered out rather than folded back down
+/// into the audible band.
+fn resample_to_target(samples: &[f32], source_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate == TARGET_SAMPLE_RATE {
         return samples.to_vec();
     }
-
-    let output_len =
-        ((samples.len() as f64 * target_rate as f64 / source_rate as f64).round() as usize).max(1);
-    let scale = source_rate as f64 / target_rate as f64;
-    let mut output = Vec::with_capacity(output_len);
-    for index in 0..output_len {
-        let position = index as f64 * scale;
-        let left = position.floor() as usize;
-        let left = left.min(samples.len() - 1);
-        let right = (left + 1).min(samples.len() - 1);
-        let fraction = (position - left as f64) as f32;
-        output.push(samples[left] * (1.0 - fraction) + samples[right] * fraction);
-    }
-    output
+    let mut resampler = Resampler::to_denoiser_rate(source_rate as f64, 1);
+    let mut out = Vec::with_capacity(
+        (samples.len() as f64 * TARGET_SAMPLE_RATE as f64 / source_rate as f64) as usize + 64,
+    );
+    resampler.process(samples, &mut out);
+    resampler.flush(&mut out);
+    out
 }
 
 fn invalid_input(message: impl Into<String>) -> Box<IoError> {
@@ -360,7 +347,15 @@ mod tests {
 
         write_recorded_wav(&input_path, &input_samples, 2, 24_000).unwrap();
         let written = denoise_wav(&input_path, &output_path).unwrap();
-        assert_eq!(written, FRAME_SIZE * 3);
+
+        // 1920 interleaved stereo samples is 960 mono frames at 24kHz, which becomes 1920 at
+        // 48kHz. `denoise_offline` preserves length, so nothing is dropped any more; allow a
+        // little slack for the resampler's edge handling.
+        let expected = 960 * 48_000 / 24_000;
+        assert!(
+            written.abs_diff(expected) <= 64,
+            "wrote {written} samples, expected about {expected}"
+        );
 
         let reader = WavReader::open(&output_path).unwrap();
         assert_eq!(reader.spec().channels, 1);

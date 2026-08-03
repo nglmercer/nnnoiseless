@@ -31,7 +31,6 @@ pub struct DenoiseParams {
     pitch_filter: bool,
     pitch_interval: usize,
     lookahead: usize,
-    prime: bool,
 }
 
 impl Default for DenoiseParams {
@@ -46,7 +45,6 @@ impl Default for DenoiseParams {
             pitch_filter: true,
             pitch_interval: 1,
             lookahead: 0,
-            prime: false,
         }
     }
 }
@@ -154,19 +152,6 @@ impl DenoiseParams {
         self
     }
 
-    /// Primes the denoiser with the first frame, so that no output frame has to be discarded.
-    ///
-    /// Normally the first output frame is silence, because the algorithm needs one frame of
-    /// history before it can reconstruct anything, and callers are expected to throw it away.
-    /// With priming the first frame is fed through twice, once to fill the history and once
-    /// for real, so output frame 0 corresponds to input frame 0.
-    ///
-    /// This changes the input-to-output alignment, so it is off by default.
-    pub fn prime(mut self, enabled: bool) -> DenoiseParams {
-        self.prime = enabled;
-        self
-    }
-
     pub(crate) fn gain_decay_value(&self) -> f32 {
         self.gain_decay
     }
@@ -191,9 +176,6 @@ impl DenoiseParams {
     pub(crate) fn lookahead_value(&self) -> usize {
         self.lookahead
     }
-    pub(crate) fn prime_enabled(&self) -> bool {
-        self.prime
-    }
 }
 
 #[cfg(test)]
@@ -212,7 +194,6 @@ mod tests {
         assert!(p.pitch_filter_enabled());
         assert_eq!(p.pitch_interval_value(), 1);
         assert_eq!(p.lookahead_value(), 0);
-        assert!(!p.prime_enabled());
     }
 
     #[test]
@@ -225,7 +206,9 @@ mod tests {
 
         // The sign is not meaningful: attenuation is always downward.
         assert_eq!(
-            DenoiseParams::default().max_attenuation_db(-12.0).min_gain(),
+            DenoiseParams::default()
+                .max_attenuation_db(-12.0)
+                .min_gain(),
             DenoiseParams::default().max_attenuation_db(12.0).min_gain()
         );
 
@@ -246,15 +229,28 @@ mod tests {
 
     #[test]
     fn out_of_range_values_are_clamped() {
-        assert_eq!(DenoiseParams::default().gain_decay(-1.0).gain_decay_value(), 0.0);
-        assert_eq!(DenoiseParams::default().gain_decay(5.0).gain_decay_value(), 1.0);
-        assert_eq!(DenoiseParams::default().gain_rise(-3.0).gain_rise_value(), 0.0);
         assert_eq!(
-            DenoiseParams::default().vad_threshold(7.0).vad_threshold_value(),
+            DenoiseParams::default().gain_decay(-1.0).gain_decay_value(),
+            0.0
+        );
+        assert_eq!(
+            DenoiseParams::default().gain_decay(5.0).gain_decay_value(),
             1.0
         );
         assert_eq!(
-            DenoiseParams::default().pitch_interval(0).pitch_interval_value(),
+            DenoiseParams::default().gain_rise(-3.0).gain_rise_value(),
+            0.0
+        );
+        assert_eq!(
+            DenoiseParams::default()
+                .vad_threshold(7.0)
+                .vad_threshold_value(),
+            1.0
+        );
+        assert_eq!(
+            DenoiseParams::default()
+                .pitch_interval(0)
+                .pitch_interval_value(),
             1
         );
     }

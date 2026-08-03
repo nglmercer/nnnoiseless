@@ -22,9 +22,14 @@ reference = []
 # Keep the neural-network weights quantized as `i8` in memory and widen them
 # during inference. Saves ~3x model memory at a cost in speed.
 low-memory = []
+# JavaScript/WebAssembly bindings. Build with
+# `wasm-pack build --target web --no-default-features --features wasm`.
+wasm = ["dep:wasm-bindgen"]
 
 [lib]
 path = "src/lib.rs"
+# `cdylib` is what the WebAssembly build links; `rlib` keeps normal Rust use working.
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "nnnoiseless"
@@ -47,6 +52,7 @@ clap = { version = "3.1.1", features = ["cargo"], optional = true }
 cpal = { version = "0.18.1", optional = true }
 dasp = { version = "0.11.0", features = ["signal"], optional = true }
 hound = { version = "3.4.0", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
 
 [profile.release]
 lto = "thin"

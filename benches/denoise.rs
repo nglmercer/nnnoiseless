@@ -12,9 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use nnnoiseless::{
-    ChannelLink, DenoiseParams, DenoiseState, MultiDenoiser, Resampler, FRAME_SIZE,
-};
+use nnnoiseless::{ChannelLink, DenoiseParams, DenoiseState, MultiDenoiser, Resampler, FRAME_SIZE};
 
 const SECONDS: usize = 20;
 const SAMPLE_RATE: usize = 48_000;
