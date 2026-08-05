@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
 use ndarray::{ArrayView2, ArrayViewMut2};
@@ -48,6 +49,11 @@ impl std::error::Error for HushError {}
 #[derive(Clone)]
 pub struct HushModel {
     params: DfParams,
+    // `DfParams::from_bytes` currently exposes a static-byte API even though
+    // it copies every archive entry into owned buffers. Keep the source alive
+    // for the duration of parsing without leaking it for every browser clip.
+    #[allow(dead_code)]
+    source_bytes: Option<Arc<[u8]>>,
 }
 
 impl HushModel {
@@ -56,26 +62,47 @@ impl HushModel {
         let path = path.as_ref();
         let params = DfParams::new(path.to_path_buf())
             .map_err(|error| HushError::new(format!("could not load Hush model: {error}")))?;
-        Ok(HushModel { params })
+        Ok(HushModel {
+            params,
+            source_bytes: None,
+        })
     }
 
     /// Loads a Hush ONNX bundle from memory.
     ///
     /// The upstream DeepFilterNet API currently accepts a `&'static [u8]` for
     /// its in-memory loader even though it copies the archive entries while
-    /// parsing. The input is therefore intentionally leaked once per model
-    /// load so this API can be used by WebAssembly, where filesystem loading is
-    /// unavailable. Load the model once and reuse the returned [`HushModel`].
+    /// parsing. The backing bytes are kept alive by the returned model during
+    /// parsing and reclaimed with it, so repeated browser clip processing does
+    /// not leak the model bundle.
     pub fn from_bytes(bytes: &[u8]) -> Result<HushModel, HushError> {
-        let bytes: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
-        Self::from_static_bytes(bytes)
+        let source_bytes: Arc<[u8]> = Arc::from(bytes);
+        // The pinned DeepFilterNet 0.5.3 parser copies enc.onnx, erb_dec.onnx,
+        // df_dec.onnx, and config.ini before returning. It never stores this
+        // view. Keeping `source_bytes` in HushModel makes that contract explicit
+        // and prevents the static API from becoming a use-after-free if the
+        // parser is ever changed without updating this adapter.
+        // SAFETY: the pinned parser consumes the slice synchronously and copies
+        // all archive entries before returning; `source_bytes` is retained in
+        // the returned model for the whole lifetime of the parsed parameters.
+        let static_bytes: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(source_bytes.as_ptr(), source_bytes.len()) };
+        let params = DfParams::from_bytes(static_bytes)
+            .map_err(|error| HushError::new(format!("could not parse Hush model: {error}")))?;
+        Ok(HushModel {
+            params,
+            source_bytes: Some(source_bytes),
+        })
     }
 
     /// Loads a Hush ONNX bundle from static bytes.
     pub fn from_static_bytes(bytes: &'static [u8]) -> Result<HushModel, HushError> {
         let params = DfParams::from_bytes(bytes)
             .map_err(|error| HushError::new(format!("could not parse Hush model: {error}")))?;
-        Ok(HushModel { params })
+        Ok(HushModel {
+            params,
+            source_bytes: None,
+        })
     }
 
     /// Creates an independent streaming denoiser with unlimited attenuation.

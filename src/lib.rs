@@ -37,7 +37,9 @@ mod wasm;
 pub use denoise::{denoise_offline, DenoiseState};
 pub use features::DenoiseFeatures;
 #[cfg(feature = "hush")]
-pub use hush::{HushDenoiser, HushError, HushModel, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
+pub use hush::{
+    HushDenoiser, HushError, HushModel, HUSH_FRAME_SIZE, HUSH_LATENCY_SAMPLES, HUSH_SAMPLE_RATE,
+};
 pub use multi::{ChannelLink, MultiDenoiser};
 pub use params::DenoiseParams;
 pub use resample::Resampler;
