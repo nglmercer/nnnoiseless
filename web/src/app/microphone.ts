@@ -6,7 +6,8 @@ import { state } from './state';
 import { ui } from './ui';
 import { errorMessage } from './errors';
 
-const SAMPLE_RATE = 48_000;
+const RNNOISE_SAMPLE_RATE = 48_000;
+const HUSH_SAMPLE_RATE = 16_000;
 
 // Some browsers expose a smaller global inside AudioWorkletGlobalScope and do
 // not provide TextDecoder there. wasm-bindgen's no-modules glue uses it while
@@ -84,6 +85,11 @@ export async function startMic(): Promise<void> {
   ui.mic.textContent = 'Starting…';
 
   try {
+    const current = settings();
+    if (current.backend === 'hush' && !state.hushModel) {
+      throw new Error('load a Hush model bundle before starting the microphone');
+    }
+
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
@@ -92,7 +98,9 @@ export async function startMic(): Promise<void> {
       },
     });
 
-    const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    const ctx = new AudioContext({
+      sampleRate: current.backend === 'hush' ? HUSH_SAMPLE_RATE : RNNOISE_SAMPLE_RATE,
+    });
     await ctx.resume();
     await registerWorklet(ctx);
 
@@ -120,10 +128,11 @@ export async function startMic(): Promise<void> {
 
     const wasmBytes = await (await fetch(workletWasmUrl)).arrayBuffer();
     const module = await WebAssembly.compile(wasmBytes);
-    const current = settings();
     node.port.postMessage({
       type: 'init',
       module,
+      backend: current.backend,
+      modelBytes: current.backend === 'hush' ? state.hushModel : undefined,
       attenuationDb: current.attenuationDb,
       vadThreshold: current.vadThreshold,
     });

@@ -4,6 +4,8 @@ export type Clip = {
   name: string;
 };
 
+export type Backend = 'rnnoise' | 'hush';
+
 export type MicState = {
   ctx: AudioContext;
   stream: MediaStream;
@@ -17,9 +19,11 @@ export type AppState = {
   audioCtx: AudioContext | null;
   playing: AudioBufferSourceNode | null;
   mic: MicState | null;
+  hushModel: Uint8Array | null;
 };
 
 export type Settings = {
+  backend: Backend;
   attenuationDb: number;
   vadThreshold: number;
   lookahead: number;

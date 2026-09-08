@@ -10,7 +10,14 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
-import init, { Denoiser, activeIsa, denoiseBuffer, version } from './src/pkg/nnnoiseless.js';
+import init, {
+  Denoiser,
+  HushDenoiser,
+  activeIsa,
+  denoiseBuffer,
+  denoiseHushBuffer,
+  version,
+} from './src/pkg/nnnoiseless.js';
 
 const wasmPath = fileURLToPath(new URL('./src/pkg/nnnoiseless_bg.wasm', import.meta.url));
 await init({ module_or_path: await readFile(wasmPath) });
@@ -151,6 +158,98 @@ const afterChange = denoiser.push(mixed.subarray(0, BLOCK));
 check('settings can change mid-stream', afterChange.every(Number.isFinite));
 denoiser.reset();
 denoiser.free();
+
+// --- Hush backend ----------------------------------------------------------
+
+const hushModelPath = process.env.HUSH_MODEL;
+if (hushModelPath) {
+  const hushModel = new Uint8Array(await readFile(hushModelPath));
+  const loadStarted = performance.now();
+  const hush = HushDenoiser.fromModelBytes(hushModel, 0);
+  const loadMs = performance.now() - loadStarted;
+  check('Hush reports its native sample rate', hush.sampleRate === 16_000, String(hush.sampleRate));
+  check('Hush reports its frame size', hush.frameSize === 160, String(hush.frameSize));
+  check('Hush reports algorithmic latency', hush.latencySamples === 320, String(hush.latencySamples));
+
+  const hushFrame = new Float32Array(hush.frameSize);
+  let phase = 0;
+  const hushFrames = 2_000; // 20 seconds at 16 kHz
+  let hushProduced = 0;
+  let hushOutputFinite = true;
+  let hushLsnrFinite = true;
+  const processStarted = performance.now();
+  for (let frame = 0; frame < hushFrames; frame += 1) {
+    for (let i = 0; i < hushFrame.length; i += 1) {
+      phase += (2 * Math.PI * 180) / 16_000;
+      hushFrame[i] = Math.sin(phase) * 0.1;
+    }
+    const out = hush.push(hushFrame);
+    hushProduced += out.length;
+    hushOutputFinite &&= out.every(Number.isFinite);
+    hushLsnrFinite &&= Number.isFinite(hush.lsnrDb);
+  }
+  const processMs = performance.now() - processStarted;
+  const audioSeconds = (hushFrames * hush.frameSize) / hush.sampleRate;
+  console.log(
+    `     Hush load: ${loadMs.toFixed(0)} ms; process: ${processMs.toFixed(0)} ms ` +
+      `(${((processMs * 1000) / hushFrames).toFixed(1)} us/frame, ` +
+      `${(audioSeconds / (processMs / 1000)).toFixed(2)}x realtime)`,
+  );
+  check('Hush output is finite', hushOutputFinite);
+  check('Hush L-SNR is finite', hushLsnrFinite);
+  check(
+    'Hush streaming uses the synthesis delay',
+    hushProduced === hushFrames * hush.frameSize - 160,
+    `${hushProduced} samples`,
+  );
+
+  hush.reset();
+  const finiteHushInput = new Float32Array(4 * hush.frameSize + 37);
+  let finitePhase = 0;
+  for (let i = 0; i < finiteHushInput.length; i += 1) {
+    finitePhase += (2 * Math.PI * 220) / hush.sampleRate;
+    finiteHushInput[i] = Math.sin(finitePhase) * 0.1;
+  }
+  let finiteHushProduced = 0;
+  for (let offset = 0; offset < finiteHushInput.length; offset += 97) {
+    const block = finiteHushInput.subarray(offset, Math.min(offset + 97, finiteHushInput.length));
+    finiteHushProduced += hush.push(block).length;
+  }
+  const finishedHush = hush.finish();
+  finiteHushProduced += finishedHush.length;
+  check(
+    'Hush finish returns the complete finite stream',
+    finiteHushProduced === finiteHushInput.length,
+    `${finiteHushProduced} of ${finiteHushInput.length} samples`,
+  );
+  check('Hush finish output is finite', finishedHush.every(Number.isFinite));
+  check('Hush finish releases delayed audio', finishedHush.some((sample) => Math.abs(sample) > 1e-6));
+
+  const hushOfflineInput = new Float32Array(200 * hush.frameSize);
+  let offlinePhase = 0;
+  for (let i = 0; i < hushOfflineInput.length; i += 1) {
+    offlinePhase += (2 * Math.PI * 180) / hush.sampleRate;
+    hushOfflineInput[i] = Math.sin(offlinePhase) * 0.1;
+  }
+  const hushOffline = denoiseHushBuffer(
+    hushOfflineInput,
+    hush.sampleRate,
+    0,
+    hushModel,
+  );
+  check('Hush offline preserves length', hushOffline.length === hushOfflineInput.length);
+  check('Hush offline output is finite', hushOffline.every(Number.isFinite));
+  check('Hush offline output is non-silent', hushOffline.some((sample) => Math.abs(sample) > 0));
+  const hushTail = hushOffline.subarray(hushOffline.length - 320);
+  check(
+    'Hush offline preserves tail audio',
+    hushTail.some((sample) => Math.abs(sample) > 1e-6),
+  );
+
+  hush.free();
+} else {
+  console.log('     Hush checks skipped — set HUSH_MODEL to the released ONNX bundle');
+}
 
 // --- edge cases ------------------------------------------------------------
 

@@ -24,6 +24,22 @@
         <div class="controls">
           <label>
             <span class="label-row">
+              <span>Backend</span>
+              <span class="label-actions"><output id="hush-model-info">RNNoise</output></span>
+            </span>
+            <select id="ctl-backend">
+              <option value="rnnoise">RNNoise — 48 kHz</option>
+              <option value="hush">Hush — 16 kHz</option>
+            </select>
+          </label>
+
+          <label class="filebutton">
+            <input type="file" id="hush-model-input" accept=".tar.gz,application/gzip" aria-label="Load Hush model bundle" />
+            <span>Load Hush model bundle</span>
+          </label>
+
+          <label>
+            <span class="label-row">
               <span>Attenuation limit</span>
               <span class="label-actions">
                 <output id="out-attenuation">off</output>
@@ -127,7 +143,7 @@
           </label>
         </div>
         <div class="meter-block">
-          <span class="meter-label">Speech probability</span>
+          <span class="meter-label">Speech estimate</span>
           <div
             class="meter"
             role="meter"
