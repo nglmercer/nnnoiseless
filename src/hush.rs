@@ -13,13 +13,25 @@ use std::sync::Arc;
 use df::tract::{DfParams, DfTract, ReduceMask, RuntimeParams};
 use ndarray::{ArrayView2, ArrayViewMut2};
 
-/// Hush's native sample rate.
+/// Hush's native sample rate, in samples per second.
+///
+/// Hush models are trained for and run at 16 kHz. Callers using another rate
+/// should resample around [`HushDenoiser::process_frame`], or use
+/// [`denoise_hush_buffer`], which does that conversion for a complete buffer.
 pub const HUSH_SAMPLE_RATE: usize = 16_000;
 
-/// Hush's streaming hop size: 10 ms at [`HUSH_SAMPLE_RATE`].
+/// Hush's streaming frame size: 160 samples, or 10 ms at [`HUSH_SAMPLE_RATE`].
+///
+/// [`HushDenoiser::process_frame`] requires exactly this many normalized mono
+/// `f32` samples on every call.
 pub const HUSH_FRAME_SIZE: usize = 160;
 
-/// The model's documented algorithmic delay in samples at 16 kHz.
+/// Hush's documented algorithmic latency: 320 samples, or 20 ms at
+/// [`HUSH_SAMPLE_RATE`] (two [`HUSH_FRAME_SIZE`]-sample frames).
+///
+/// Streaming callers should expect output to be delayed by this amount. The
+/// complete-buffer helper feeds silent flush frames internally so this delay
+/// does not turn into a silent tail in the returned audio.
 pub const HUSH_LATENCY_SAMPLES: usize = 320;
 
 /// An error returned while loading or running a Hush model.
@@ -46,6 +58,12 @@ impl std::error::Error for HushError {}
 /// released by Hush. It contains the encoder, ERB decoder, deep-filter
 /// decoder, and the model configuration. The immutable parameters can be
 /// cloned to create independent streaming sessions.
+///
+/// A model owns the parsed parameters and, for [`Self::from_bytes`], a private
+/// copy of the input archive. The archive does not need to remain available
+/// after loading. The immutable model can be shared between threads; create a
+/// separate [`HushDenoiser`] for each audio stream because denoiser state is
+/// mutable and stream-specific.
 #[derive(Clone)]
 pub struct HushModel {
     params: DfParams,
@@ -58,6 +76,11 @@ pub struct HushModel {
 
 impl HushModel {
     /// Loads a Hush ONNX bundle from a filesystem path.
+    ///
+    /// `path` must point to Hush's
+    /// `advanced_dfnet16k_model_best_onnx.tar.gz` bundle. The file is read and
+    /// parsed before this method returns; the returned model owns everything
+    /// needed to create denoisers and does not retain the path or file handle.
     pub fn from_path(path: impl AsRef<Path>) -> Result<HushModel, HushError> {
         let path = path.as_ref();
         let params = DfParams::new(path.to_path_buf())
@@ -70,11 +93,11 @@ impl HushModel {
 
     /// Loads a Hush ONNX bundle from memory.
     ///
-    /// The upstream DeepFilterNet API currently accepts a `&'static [u8]` for
-    /// its in-memory loader even though it copies the archive entries while
-    /// parsing. The backing bytes are kept alive by the returned model during
-    /// parsing and reclaimed with it, so repeated browser clip processing does
-    /// not leak the model bundle.
+    /// `bytes` must contain Hush's
+    /// `advanced_dfnet16k_model_best_onnx.tar.gz` bundle. The input is copied
+    /// into model-owned storage, so the caller may release or reuse its buffer
+    /// after this method returns. Repeated loads reclaim that storage when the
+    /// corresponding model is dropped.
     pub fn from_bytes(bytes: &[u8]) -> Result<HushModel, HushError> {
         let source_bytes: Arc<[u8]> = Arc::from(bytes);
         // The pinned DeepFilterNet 0.5.3 parser copies enc.onnx, erb_dec.onnx,
@@ -82,11 +105,7 @@ impl HushModel {
         // view. Keeping `source_bytes` in HushModel makes that contract explicit
         // and prevents the static API from becoming a use-after-free if the
         // parser is ever changed without updating this adapter.
-        // SAFETY: the pinned parser consumes the slice synchronously and copies
-        // all archive entries before returning; `source_bytes` is retained in
-        // the returned model for the whole lifetime of the parsed parameters.
-        let static_bytes: &'static [u8] =
-            unsafe { std::slice::from_raw_parts(source_bytes.as_ptr(), source_bytes.len()) };
+        let static_bytes = leaked_static_view(&source_bytes);
         let params = DfParams::from_bytes(static_bytes)
             .map_err(|error| HushError::new(format!("could not parse Hush model: {error}")))?;
         Ok(HushModel {
@@ -95,7 +114,11 @@ impl HushModel {
         })
     }
 
-    /// Loads a Hush ONNX bundle from static bytes.
+    /// Loads a Hush ONNX bundle from bytes that are already `'static`.
+    ///
+    /// This is useful for applications that embed the model in their binary.
+    /// For downloaded or otherwise owned data, prefer [`Self::from_bytes`],
+    /// which manages the input buffer's lifetime for you.
     pub fn from_static_bytes(bytes: &'static [u8]) -> Result<HushModel, HushError> {
         let params = DfParams::from_bytes(bytes)
             .map_err(|error| HushError::new(format!("could not parse Hush model: {error}")))?;
@@ -106,6 +129,9 @@ impl HushModel {
     }
 
     /// Creates an independent streaming denoiser with unlimited attenuation.
+    ///
+    /// The returned denoiser owns its recurrent, spectral, and overlap-add
+    /// state. Calling this method again creates another independent stream.
     pub fn denoiser(&self) -> Result<HushDenoiser, HushError> {
         self.denoiser_with_attenuation_db(100.0)
     }
@@ -147,7 +173,9 @@ impl HushModel {
 ///
 /// Input and output are normalized `f32` samples in `-1.0..=1.0`, unlike the
 /// existing RNNoise API in this crate, which uses the scale of signed 16-bit
-/// PCM. Feed exactly [`HUSH_FRAME_SIZE`] samples to [`Self::process_frame`].
+/// PCM. Feed exactly [`HUSH_FRAME_SIZE`] samples to [`Self::process_frame`]
+/// in order. A denoiser belongs to one stream at a time; use [`Self::reset`]
+/// before starting a new stream.
 pub struct HushDenoiser {
     runtime: DfTract,
     frame_size: usize,
@@ -176,6 +204,12 @@ impl HushDenoiser {
     }
 
     /// Processes one normalized 10 ms mono frame and returns its local-SNR estimate.
+    ///
+    /// Both `input` and `output` must contain exactly 160 samples. Input values
+    /// are expected in the normalized `-1.0..=1.0` range, and output values are
+    /// returned in that same range. The operation updates this denoiser's
+    /// streaming state and may emit silence during the initial algorithmic
+    /// latency period.
     pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> Result<f32, HushError> {
         if input.len() != self.frame_size || output.len() != self.frame_size {
             return Err(HushError::new(format!(
@@ -199,6 +233,11 @@ impl HushDenoiser {
     }
 
     /// Changes the maximum attenuation for subsequent frames.
+    ///
+    /// `attenuation_db` must be finite and non-negative. A value of `100.0`
+    /// is effectively unlimited suppression. The current recurrent and
+    /// overlap-add state is retained; call [`Self::reset`] separately when a
+    /// new stream should start from a clean state.
     pub fn set_attenuation_limit_db(&mut self, attenuation_db: f32) -> Result<(), HushError> {
         if !attenuation_db.is_finite() || attenuation_db < 0.0 {
             return Err(HushError::new(
@@ -211,6 +250,8 @@ impl HushDenoiser {
     }
 
     /// Resets the recurrent, spectral-normalization, and overlap-add state.
+    ///
+    /// After reset, continue to provide complete 160-sample normalized frames.
     pub fn reset(&mut self) -> Result<(), HushError> {
         self.runtime
             .init()
@@ -218,6 +259,117 @@ impl HushDenoiser {
         self.last_lsnr_db = -15.0;
         Ok(())
     }
+}
+
+/// Denoises a complete normalized mono buffer with Hush.
+///
+/// Hush always runs at 16 kHz and processes 160-sample frames. If `sample_rate`
+/// differs from 16 kHz, this function resamples the input to Hush's native
+/// rate, compensates the model's 320-sample algorithmic latency, flushes the
+/// delayed tail with silent frames, and resamples the result back. The returned
+/// buffer always has exactly the same length and sample rate as `samples`.
+///
+/// `samples` and the returned values use normalized `f32` samples in
+/// `-1.0..=1.0`. `model_bytes` must contain Hush's
+/// `advanced_dfnet16k_model_best_onnx.tar.gz` bundle. The model bytes are
+/// copied while loading and may be reused or released after this call.
+pub fn denoise_hush_buffer(
+    samples: &[f32],
+    sample_rate: f32,
+    attenuation_limit_db: f32,
+    model_bytes: &[u8],
+) -> Result<Vec<f32>, HushError> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err(HushError::new("sample rate must be finite and positive"));
+    }
+
+    let rate = sample_rate as f64;
+    let at_16k = if (rate - HUSH_SAMPLE_RATE as f64).abs() < f64::EPSILON {
+        samples.to_vec()
+    } else {
+        let mut resampler = crate::Resampler::new(rate, HUSH_SAMPLE_RATE as f64, 1);
+        let mut converted = Vec::with_capacity(
+            (samples.len() as f64 * HUSH_SAMPLE_RATE as f64 / rate) as usize + 64,
+        );
+        resampler.process(samples, &mut converted);
+        resampler.flush(&mut converted);
+        converted
+    };
+
+    let model = HushModel::from_bytes(model_bytes)?;
+    let attenuation = if attenuation_limit_db > 0.0 {
+        attenuation_limit_db
+    } else {
+        100.0
+    };
+    let mut state = model.denoiser_with_attenuation_db(attenuation)?;
+    let frame_size = state.frame_size();
+    let frames = at_16k.len().div_ceil(frame_size);
+    let warmup = state.latency_samples().div_ceil(frame_size);
+    let input_energy: f32 = at_16k.iter().map(|sample| sample * sample).sum();
+    let at_16k_len = at_16k.len();
+    let mut padded = at_16k;
+    padded.resize(frames * frame_size, 0.0);
+    let mut input = vec![0.0; frame_size];
+    let mut frame_out = vec![0.0; frame_size];
+    let mut enhanced = vec![0.0; padded.len()];
+
+    for (frame_index, chunk) in padded.chunks_exact(frame_size).enumerate() {
+        input.copy_from_slice(chunk);
+        state.process_frame(&mut frame_out, &input)?;
+        if frame_index >= warmup {
+            let start = (frame_index - warmup) * frame_size;
+            enhanced[start..start + frame_size].copy_from_slice(&frame_out);
+        }
+    }
+
+    // The last `warmup` outputs are still inside Hush's delay line after the
+    // final real input frame. Feed silent frames to release them, but only copy
+    // the corresponding delayed output slots into the original-length buffer.
+    // DeepFilterNet 0.5.3 short-circuits exactly silent frames before its
+    // overlap-add synthesis. This numerically silent level is just above that
+    // internal threshold, allowing the delayed tail to be released without
+    // contributing audible flush audio to the returned buffer.
+    let flush_level = if input_energy >= 1e-7 * at_16k_len as f32 {
+        0.0004
+    } else {
+        0.0
+    };
+    input.fill(flush_level);
+    for frame_index in frames..(frames + warmup) {
+        state.process_frame(&mut frame_out, &input)?;
+        if frame_index >= warmup {
+            let start = (frame_index - warmup) * frame_size;
+            if start + frame_size <= enhanced.len() {
+                enhanced[start..start + frame_size].copy_from_slice(&frame_out);
+            }
+        }
+    }
+    enhanced.truncate(at_16k_len.min(enhanced.len()));
+
+    let mut result = if (rate - HUSH_SAMPLE_RATE as f64).abs() < f64::EPSILON {
+        enhanced
+    } else {
+        let mut resampler = crate::Resampler::new(HUSH_SAMPLE_RATE as f64, rate, 1);
+        let mut converted = Vec::with_capacity(samples.len() + 64);
+        resampler.process(&enhanced, &mut converted);
+        resampler.flush(&mut converted);
+        converted
+    };
+    result.resize(samples.len(), 0.0);
+    Ok(result)
+}
+
+fn leaked_static_view(bytes: &Arc<[u8]>) -> &'static [u8] {
+    // SAFETY:
+    //
+    // DeepFilterNet v0.5.3 consumes the byte slice synchronously.
+    // It copies all archive entries into owned buffers before returning.
+    // HushModel keeps Arc<[u8]> alive for the entire model/runtime lifetime.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
 }
 
 #[cfg(test)]

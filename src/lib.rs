@@ -38,7 +38,8 @@ pub use denoise::{denoise_offline, DenoiseState};
 pub use features::DenoiseFeatures;
 #[cfg(feature = "hush")]
 pub use hush::{
-    HushDenoiser, HushError, HushModel, HUSH_FRAME_SIZE, HUSH_LATENCY_SAMPLES, HUSH_SAMPLE_RATE,
+    denoise_hush_buffer, HushDenoiser, HushError, HushModel, HUSH_FRAME_SIZE, HUSH_LATENCY_SAMPLES,
+    HUSH_SAMPLE_RATE,
 };
 pub use multi::{ChannelLink, MultiDenoiser};
 pub use params::DenoiseParams;

@@ -15,6 +15,7 @@ import init, {
   HushDenoiser,
   activeIsa,
   denoiseBuffer,
+  denoiseHushBuffer,
   version,
 } from './src/pkg/nnnoiseless.js';
 
@@ -197,6 +198,28 @@ if (hushModelPath) {
   check('Hush output is finite', hushOutputFinite);
   check('Hush L-SNR is finite', hushLsnrFinite);
   check('Hush streaming produces delayed output', hushProduced > 0, `${hushProduced} samples`);
+
+  const hushOfflineInput = new Float32Array(200 * hush.frameSize);
+  let offlinePhase = 0;
+  for (let i = 0; i < hushOfflineInput.length; i += 1) {
+    offlinePhase += (2 * Math.PI * 180) / hush.sampleRate;
+    hushOfflineInput[i] = Math.sin(offlinePhase) * 0.1;
+  }
+  const hushOffline = denoiseHushBuffer(
+    hushOfflineInput,
+    hush.sampleRate,
+    0,
+    hushModel,
+  );
+  check('Hush offline preserves length', hushOffline.length === hushOfflineInput.length);
+  check('Hush offline output is finite', hushOffline.every(Number.isFinite));
+  check('Hush offline output is non-silent', hushOffline.some((sample) => Math.abs(sample) > 0));
+  const hushTail = hushOffline.subarray(hushOffline.length - 320);
+  check(
+    'Hush offline preserves tail audio',
+    hushTail.some((sample) => Math.abs(sample) > 1e-6),
+  );
+
   hush.reset();
   hush.free();
 } else {

@@ -1,0 +1,88 @@
+name: Hush backend
+
+on:
+  push:
+    branches:
+      - main
+      - feat/hush-backend
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pin the model repository revision and verify the downloaded bytes below so
+  # a mutable model endpoint cannot silently change the integration test.
+  HUSH_MODEL_URL: https://huggingface.co/weya-ai/hush/resolve/e4ce7721d519438e8c2fa0b1f7cc27e1868fff99/onnx/advanced_dfnet16k_model_best_onnx.tar.gz?download=true
+  HUSH_MODEL_SHA256: 45632ccaa82b71bb743d6caa7c78e983fe2f2790a3af7f6ec48e6ed7ba085df6
+
+jobs:
+  rust-hush:
+    name: Rust Hush tests
+    runs-on: ubuntu-latest
+    env:
+      HUSH_MODEL: ./models/hush.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download and verify Hush model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$HUSH_MODEL")"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            "$HUSH_MODEL_URL" --output "$HUSH_MODEL"
+          echo "$HUSH_MODEL_SHA256  $HUSH_MODEL" | sha256sum --check --strict
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check clippy
+        run: cargo clippy --features hush -- -D warnings
+
+      - name: Run Hush tests
+        run: cargo test --features hush
+
+  wasm:
+    name: WASM and TypeScript build
+    runs-on: ubuntu-latest
+    env:
+      HUSH_MODEL: ${{ github.workspace }}/models/hush.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Download and verify Hush model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$HUSH_MODEL")"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            "$HUSH_MODEL_URL" --output "$HUSH_MODEL"
+          echo "$HUSH_MODEL_SHA256  $HUSH_MODEL" | sha256sum --check --strict
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Build WASM, TypeScript, and run smoke tests
+        working-directory: web
+        run: npm run build
