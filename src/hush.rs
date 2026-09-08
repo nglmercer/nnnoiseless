@@ -29,10 +29,24 @@ pub const HUSH_FRAME_SIZE: usize = 160;
 /// Hush's documented algorithmic latency: 320 samples, or 20 ms at
 /// [`HUSH_SAMPLE_RATE`] (two [`HUSH_FRAME_SIZE`]-sample frames).
 ///
-/// Streaming callers should expect output to be delayed by this amount. The
-/// complete-buffer helper feeds silent flush frames internally so this delay
-/// does not turn into a silent tail in the returned audio.
-pub const HUSH_LATENCY_SAMPLES: usize = 320;
+/// This is the model's reported algorithmic latency. It is distinct from the
+/// shorter synthesis delay used to align output samples.
+pub const HUSH_ALGORITHMIC_LATENCY_SAMPLES: usize = 320;
+
+/// Hush's overlap-add synthesis delay: `fft_size - hop_size`, or 160 samples
+/// for the pinned 320-sample FFT and 160-sample hop.
+///
+/// Buffer and streaming adapters use this value when discarding initial output
+/// and flushing the final delayed frame. It must not be confused with
+/// [`HUSH_ALGORITHMIC_LATENCY_SAMPLES`].
+pub const HUSH_SYNTHESIS_DELAY_SAMPLES: usize = 160;
+
+/// Compatibility alias for the pre-split latency constant.
+pub const HUSH_LATENCY_SAMPLES: usize = HUSH_ALGORITHMIC_LATENCY_SAMPLES;
+
+fn build_runtime_params(attenuation_db: f32) -> RuntimeParams {
+    RuntimeParams::new(1, false, attenuation_db, -15.0, 35.0, 35.0, ReduceMask::MAX)
+}
 
 /// An error returned while loading or running a Hush model.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,22 +162,31 @@ impl HushModel {
             ));
         }
 
-        let runtime =
-            RuntimeParams::new(1, false, attenuation_db, -15.0, 35.0, 35.0, ReduceMask::MAX);
-        let runtime = DfTract::new(self.params.clone(), &runtime).map_err(|error| {
+        let runtime_params = build_runtime_params(attenuation_db);
+        let runtime = DfTract::new(self.params.clone(), &runtime_params).map_err(|error| {
             HushError::new(format!("could not initialize Hush runtime: {error}"))
         })?;
 
-        if runtime.sr != HUSH_SAMPLE_RATE || runtime.hop_size != HUSH_FRAME_SIZE {
+        if runtime.sr != HUSH_SAMPLE_RATE
+            || runtime.hop_size != HUSH_FRAME_SIZE
+            || runtime.fft_size.saturating_sub(runtime.hop_size) != HUSH_SYNTHESIS_DELAY_SAMPLES
+        {
             return Err(HushError::new(format!(
-                "model is {} Hz with {}-sample frames; expected Hush's {} Hz/{}-sample contract",
-                runtime.sr, runtime.hop_size, HUSH_SAMPLE_RATE, HUSH_FRAME_SIZE
+                "model is {} Hz with {}-sample frames and {}-sample synthesis delay; expected Hush's {} Hz/{}-sample/{}-sample contract",
+                runtime.sr,
+                runtime.hop_size,
+                runtime.fft_size.saturating_sub(runtime.hop_size),
+                HUSH_SAMPLE_RATE,
+                HUSH_FRAME_SIZE,
+                HUSH_SYNTHESIS_DELAY_SAMPLES,
             )));
         }
 
         Ok(HushDenoiser {
+            params: self.params.clone(),
             runtime,
             frame_size: HUSH_FRAME_SIZE,
+            attenuation_db,
             last_lsnr_db: -15.0,
         })
     }
@@ -177,8 +200,10 @@ impl HushModel {
 /// in order. A denoiser belongs to one stream at a time; use [`Self::reset`]
 /// before starting a new stream.
 pub struct HushDenoiser {
+    params: DfParams,
     runtime: DfTract,
     frame_size: usize,
+    attenuation_db: f32,
     last_lsnr_db: f32,
 }
 
@@ -194,8 +219,11 @@ impl HushDenoiser {
     }
 
     /// Returns the documented algorithmic delay in samples.
+    ///
+    /// Output alignment uses [`HUSH_SYNTHESIS_DELAY_SAMPLES`], which is the
+    /// overlap-add delay rather than this model-level latency figure.
     pub fn latency_samples(&self) -> usize {
-        HUSH_LATENCY_SAMPLES
+        HUSH_ALGORITHMIC_LATENCY_SAMPLES
     }
 
     /// Returns the local-SNR estimate from the most recently processed frame.
@@ -208,8 +236,8 @@ impl HushDenoiser {
     /// Both `input` and `output` must contain exactly 160 samples. Input values
     /// are expected in the normalized `-1.0..=1.0` range, and output values are
     /// returned in that same range. The operation updates this denoiser's
-    /// streaming state and may emit silence during the initial algorithmic
-    /// latency period.
+    /// streaming state and may emit silence during the initial synthesis
+    /// delay period.
     pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> Result<f32, HushError> {
         if input.len() != self.frame_size || output.len() != self.frame_size {
             return Err(HushError::new(format!(
@@ -246,16 +274,23 @@ impl HushDenoiser {
         }
         self.runtime
             .set_atten_lim(attenuation_db)
-            .map_err(|error| HushError::new(format!("could not set Hush attenuation: {error}")))
+            .map_err(|error| HushError::new(format!("could not set Hush attenuation: {error}")))?;
+        self.attenuation_db = attenuation_db;
+        Ok(())
     }
 
     /// Resets the recurrent, spectral-normalization, and overlap-add state.
     ///
+    /// DeepFilterNet's `DfTract::init()` does not reset its recurrent Tract
+    /// plans or the `DFState` analysis/synthesis memory, so reset constructs a
+    /// fresh runtime from the retained model and runtime parameters.
     /// After reset, continue to provide complete 160-sample normalized frames.
     pub fn reset(&mut self) -> Result<(), HushError> {
-        self.runtime
-            .init()
-            .map_err(|error| HushError::new(format!("could not reset Hush runtime: {error}")))?;
+        self.runtime = DfTract::new(
+            self.params.clone(),
+            &build_runtime_params(self.attenuation_db),
+        )
+        .map_err(|error| HushError::new(format!("could not reset Hush runtime: {error}")))?;
         self.last_lsnr_db = -15.0;
         Ok(())
     }
@@ -265,7 +300,7 @@ impl HushDenoiser {
 ///
 /// Hush always runs at 16 kHz and processes 160-sample frames. If `sample_rate`
 /// differs from 16 kHz, this function resamples the input to Hush's native
-/// rate, compensates the model's 320-sample algorithmic latency, flushes the
+/// rate, compensates the model's 160-sample synthesis delay, flushes the
 /// delayed tail with silent frames, and resamples the result back. The returned
 /// buffer always has exactly the same length and sample rate as `samples`.
 ///
@@ -308,7 +343,7 @@ pub fn denoise_hush_buffer(
     let mut state = model.denoiser_with_attenuation_db(attenuation)?;
     let frame_size = state.frame_size();
     let frames = at_16k.len().div_ceil(frame_size);
-    let warmup = state.latency_samples().div_ceil(frame_size);
+    let warmup = HUSH_SYNTHESIS_DELAY_SAMPLES.div_ceil(frame_size);
     let input_energy: f32 = at_16k.iter().map(|sample| sample * sample).sum();
     let at_16k_len = at_16k.len();
     let mut padded = at_16k;
@@ -382,6 +417,8 @@ mod tests {
         // when HUSH_MODEL is supplied; this test keeps the API contract cheap.
         assert_eq!(HUSH_SAMPLE_RATE, 16_000);
         assert_eq!(HUSH_FRAME_SIZE, 160);
-        assert_eq!(HUSH_LATENCY_SAMPLES, 320);
+        assert_eq!(HUSH_ALGORITHMIC_LATENCY_SAMPLES, 320);
+        assert_eq!(HUSH_SYNTHESIS_DELAY_SAMPLES, 160);
+        assert_eq!(HUSH_LATENCY_SAMPLES, HUSH_ALGORITHMIC_LATENCY_SAMPLES);
     }
 }

@@ -22,6 +22,7 @@ type HushBinding = {
   readonly latencySamples: number;
   readonly lsnrDb: number;
   push(input: Float32Array): Float32Array;
+  finish(): Float32Array;
   reset(): void;
   setAttenuationLimitDb(db: number): void;
 };

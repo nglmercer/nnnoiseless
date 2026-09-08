@@ -421,6 +421,9 @@ Tract runtime. It loads Hush's `advanced_dfnet16k_model_best_onnx.tar.gz`
 bundle at runtime and keeps the existing RNNoise path unchanged. Hush accepts
 normalized mono `f32` samples at 16 kHz in 160-sample frames, while the
 RNNoise API continues to use the crate's 48 kHz, signed-16-bit-scaled contract.
+Hush reports 320 samples of model algorithmic latency, while its 160-sample
+overlap-add synthesis delay is the alignment delay used by the streaming and
+complete-buffer adapters.
 
 ```rust
 use nnnoiseless::{HushModel, HUSH_FRAME_SIZE};
@@ -443,10 +446,11 @@ HUSH_MODEL=/path/to/advanced_dfnet16k_model_best_onnx.tar.gz \
   cargo bench --features hush --bench hush
 ```
 
-The Hush WebAssembly bindings expose `HushDenoiser.fromModelBytes` and
-`denoiseHushBuffer`. The browser build includes the Tract runtime but not the
-8 MB model; the Vite demo has a model-bundle picker and a separate Hush
-microphone path that requests a 16 kHz `AudioContext`:
+The Hush WebAssembly bindings expose `HushDenoiser.fromModelBytes`, its
+streaming `push`/`finish` API, and `denoiseHushBuffer`. The browser build
+includes the Tract runtime but not the 8 MB model; the Vite demo has a
+model-bundle picker and a separate Hush microphone path that requests a 16 kHz
+`AudioContext`:
 
 ```bash
 cd web

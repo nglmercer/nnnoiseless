@@ -169,7 +169,7 @@ if (hushModelPath) {
   const loadMs = performance.now() - loadStarted;
   check('Hush reports its native sample rate', hush.sampleRate === 16_000, String(hush.sampleRate));
   check('Hush reports its frame size', hush.frameSize === 160, String(hush.frameSize));
-  check('Hush reports finite latency', Number.isFinite(hush.latencySamples));
+  check('Hush reports algorithmic latency', hush.latencySamples === 320, String(hush.latencySamples));
 
   const hushFrame = new Float32Array(hush.frameSize);
   let phase = 0;
@@ -197,7 +197,33 @@ if (hushModelPath) {
   );
   check('Hush output is finite', hushOutputFinite);
   check('Hush L-SNR is finite', hushLsnrFinite);
-  check('Hush streaming produces delayed output', hushProduced > 0, `${hushProduced} samples`);
+  check(
+    'Hush streaming uses the synthesis delay',
+    hushProduced === hushFrames * hush.frameSize - 160,
+    `${hushProduced} samples`,
+  );
+
+  hush.reset();
+  const finiteHushInput = new Float32Array(4 * hush.frameSize + 37);
+  let finitePhase = 0;
+  for (let i = 0; i < finiteHushInput.length; i += 1) {
+    finitePhase += (2 * Math.PI * 220) / hush.sampleRate;
+    finiteHushInput[i] = Math.sin(finitePhase) * 0.1;
+  }
+  let finiteHushProduced = 0;
+  for (let offset = 0; offset < finiteHushInput.length; offset += 97) {
+    const block = finiteHushInput.subarray(offset, Math.min(offset + 97, finiteHushInput.length));
+    finiteHushProduced += hush.push(block).length;
+  }
+  const finishedHush = hush.finish();
+  finiteHushProduced += finishedHush.length;
+  check(
+    'Hush finish returns the complete finite stream',
+    finiteHushProduced === finiteHushInput.length,
+    `${finiteHushProduced} of ${finiteHushInput.length} samples`,
+  );
+  check('Hush finish output is finite', finishedHush.every(Number.isFinite));
+  check('Hush finish releases delayed audio', finishedHush.some((sample) => Math.abs(sample) > 1e-6));
 
   const hushOfflineInput = new Float32Array(200 * hush.frameSize);
   let offlinePhase = 0;
@@ -220,7 +246,6 @@ if (hushModelPath) {
     hushTail.some((sample) => Math.abs(sample) > 1e-6),
   );
 
-  hush.reset();
   hush.free();
 } else {
   console.log('     Hush checks skipped — set HUSH_MODEL to the released ONNX bundle');

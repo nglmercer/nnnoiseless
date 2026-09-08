@@ -279,6 +279,8 @@ pub struct HushDenoiser {
     frame_out: Vec<f32>,
     lsnr_db: f32,
     warmup: usize,
+    received_samples: usize,
+    input_energy: f32,
 }
 
 #[cfg(feature = "hush")]
@@ -300,7 +302,7 @@ impl HushDenoiser {
             .denoiser_with_attenuation_db(attenuation)
             .map_err(js_error)?;
         let frame_size = state.frame_size();
-        let warmup = state.latency_samples().div_ceil(frame_size);
+        let warmup = crate::HUSH_SYNTHESIS_DELAY_SAMPLES.div_ceil(frame_size);
         Ok(HushDenoiser {
             state,
             pending: Vec::with_capacity(frame_size * 2),
@@ -309,6 +311,8 @@ impl HushDenoiser {
             frame_out: vec![0.0; frame_size],
             lsnr_db: -15.0,
             warmup,
+            received_samples: 0,
+            input_energy: 0.0,
         })
     }
 
@@ -325,6 +329,9 @@ impl HushDenoiser {
     }
 
     /// Hush's documented algorithmic delay in samples.
+    ///
+    /// The streaming adapter aligns frames using Hush's shorter synthesis
+    /// delay; this getter intentionally reports the model-level latency.
     #[wasm_bindgen(getter, js_name = latencySamples)]
     pub fn latency_samples(&self) -> usize {
         self.state.latency_samples()
@@ -336,26 +343,90 @@ impl HushDenoiser {
         self.lsnr_db
     }
 
+    fn process_frame(&mut self) -> Result<(), JsValue> {
+        self.lsnr_db = self
+            .state
+            .process_frame(&mut self.frame_out, &self.frame_in)
+            .map_err(js_error)?;
+        if self.warmup > 0 {
+            self.warmup -= 1;
+        } else {
+            self.ready.extend_from_slice(&self.frame_out);
+        }
+        Ok(())
+    }
+
     /// Feeds normalized samples in and returns whatever output is ready.
     pub fn push(&mut self, input: &[f32]) -> Result<Vec<f32>, JsValue> {
+        self.received_samples = self.received_samples.saturating_add(input.len());
+        let chunk_energy: f32 = input.iter().map(|sample| sample * sample).sum();
+        if chunk_energy.is_finite() {
+            self.input_energy = (self.input_energy + chunk_energy).min(f32::MAX / 2.0);
+        }
         self.pending.extend_from_slice(input);
         let frame_size = self.frame_size();
         while self.pending.len() >= frame_size {
             self.frame_in.copy_from_slice(&self.pending[..frame_size]);
             self.pending.drain(..frame_size);
-            self.lsnr_db = self
-                .state
-                .process_frame(&mut self.frame_out, &self.frame_in)
-                .map_err(js_error)?;
-            if self.warmup > 0 {
-                self.warmup -= 1;
-            } else {
-                self.ready.extend_from_slice(&self.frame_out);
-            }
+            self.process_frame()?;
         }
 
         let take = self.ready.len().min(input.len());
         Ok(self.ready.drain(..take).collect())
+    }
+
+    /// Finishes the current finite stream and returns all remaining output.
+    ///
+    /// A partial input frame is padded with zeroes, then one synthesis-delay
+    /// frame is processed to release the final real audio. Samples belonging
+    /// only to the padding are omitted. The denoiser is reset before this
+    /// method returns, so the next call to [`Self::push`] starts a new stream.
+    /// Calling `finish()` with no input returns an empty array after resetting
+    /// the session.
+    pub fn finish(&mut self) -> Result<Vec<f32>, JsValue> {
+        let frame_size = self.frame_size();
+        let pending_len = self.pending.len();
+        if self.received_samples == 0 {
+            self.reset()?;
+            return Ok(Vec::new());
+        }
+
+        if pending_len > 0 {
+            self.frame_in[..pending_len].copy_from_slice(&self.pending);
+            self.frame_in[pending_len..].fill(0.0);
+            self.pending.clear();
+            self.process_frame()?;
+        }
+
+        let flush_level = if self.input_energy >= 1e-7 * self.received_samples as f32 {
+            0.0004
+        } else {
+            0.0
+        };
+        self.frame_in.fill(flush_level);
+        for _ in 0..crate::HUSH_SYNTHESIS_DELAY_SAMPLES.div_ceil(frame_size) {
+            self.process_frame()?;
+        }
+
+        let final_frame_len = if pending_len > 0 {
+            pending_len
+        } else {
+            frame_size
+        };
+        let padding_len = frame_size - final_frame_len;
+        if padding_len > 0 {
+            let ready_len = self.ready.len();
+            if ready_len < padding_len {
+                return Err(JsValue::from_str(
+                    "Hush finish produced fewer samples than the padded frame",
+                ));
+            }
+            self.ready.truncate(ready_len - padding_len);
+        }
+
+        let output = self.ready.drain(..).collect();
+        self.reset()?;
+        Ok(output)
     }
 
     /// Changes the maximum attenuation and resets the stream's processing history.
@@ -374,7 +445,9 @@ impl HushDenoiser {
         self.pending.clear();
         self.ready.clear();
         self.lsnr_db = -15.0;
-        self.warmup = self.state.latency_samples().div_ceil(self.frame_size());
+        self.warmup = crate::HUSH_SYNTHESIS_DELAY_SAMPLES.div_ceil(self.frame_size());
+        self.received_samples = 0;
+        self.input_energy = 0.0;
         Ok(())
     }
 }

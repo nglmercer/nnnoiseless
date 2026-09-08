@@ -52,6 +52,11 @@ It denoises a synthetic noisy clip and asserts that noise actually went down
 and speech did not, then exercises the streaming API with the 128-sample blocks
 an `AudioWorklet` delivers.
 
+For a finite recording passed through `HushDenoiser.push`, call
+`HushDenoiser.finish()` after the last block. It pads any partial frame,
+returns the delayed tail, and resets the session for the next recording. The
+live microphone path remains open-ended and does not call `finish()`.
+
 To exercise Hush in the same smoke test and print its load time, microseconds
 per 10 ms frame, and realtime factor:
 
@@ -90,6 +95,8 @@ weights remain an external model bundle.
 - Output lags input by one 10 ms frame, plus one frame per unit of lookahead.
   `denoiseBuffer` compensates for this; the live path does not, since latency is
   the point there.
+- Hush's `latencySamples` reports its 20 ms algorithmic latency; its streaming
+  frame alignment uses the 10 ms overlap-add synthesis delay.
 - The synthetic sample is deterministic so the demo works offline and always
   sounds the same. Being harmonic, it flatters a pitch-driven model — load a
   real recording for a fair impression.
